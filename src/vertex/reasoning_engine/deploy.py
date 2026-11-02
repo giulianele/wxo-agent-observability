@@ -310,6 +310,8 @@ def _post_trace(
     llm_start_ns: int = 0, llm_end_ns: int = 0,
     # Tool invocation records: list of {name, input, output, start_ns, end_ns, is_error}
     tool_calls: list | None = None,
+    # Reasoning / thinking steps — each string becomes a gen_ai.reasoning span event
+    reasoning_steps: list | None = None,
     # Instance value overrides — passed from query() to avoid module global refs
     _agent_id: str = "", _agent_name: str = "", _tenant_id: str = "",
     _api_key: str = "", _token_url: str = "",
@@ -352,9 +354,52 @@ def _post_trace(
     span_name     = "invoke_agent " + agent_name
     latency_ms    = max(1, (end_ns - start_ns) // 1_000_000)
     _model        = model_name or agent_name
+    _workspace_id = "00000000-0000-0000-0000-000000000001"
+    _langfuse_tags = _json.dumps([
+        f"agent_id:{agent_id}",
+        f"environment:{environment}",
+        f"tenant_id:{tenant_id}",
+        f"workspace_id:{_workspace_id}",
+    ])
 
     def _sv(k, v): return {"key": k, "value": {"stringValue": str(v)}}
     def _iv(k, v): return {"key": k, "value": {"intValue": int(v)}}
+
+    # Structured WXO message envelope — matches wxo-server LangGraph shape
+    _input_envelope = _json.dumps({
+        "role": "user",
+        "content": prompt[:2000],
+        "mentions": None,
+        "document_ids": None,
+        "parent_message_id": None,
+        "additional_properties": {
+            "wxa_message": None,
+            "display_properties": None,
+            "tool_calls": None,
+            "tool_call_id": None,
+            "tool_name": None,
+            "wxo_connection_status": None,
+            "log_id": None,
+            "captured_logs": None,
+            "is_interrupt": False,
+            "tool_flow_properties": None,
+            "architect_conversational_state": None,
+            "current_workflow": None,
+            "metadata": None,
+            "agent_id": None,
+            "a2a_task_completed": False,
+            "error_code": None,
+        },
+        "assistant_id": None,
+        "context": None,
+        "step_history": None,
+        "message_state": None,
+        "log_id": None,
+        "meta": None,
+        "user_defined": None,
+        "session_id": session_id,
+        "trace_id": None,
+    })
 
     # ── Root span attributes (superset of AWS attributes + Vertex extras) ─────
     attributes = [
@@ -362,6 +407,7 @@ def _post_trace(
         _sv("agent.id",              agent_id),
         _sv("agent.name",            agent_name),
         _sv("agent.display_name",    agent_name),
+        _sv("agent.version",         "1"),
         _sv("gen_ai.agent.id",       agent_id),
         _sv("gen_ai.agent.name",     agent_name),
         _sv("wxo.agent.id",          agent_id),
@@ -373,21 +419,41 @@ def _post_trace(
         _sv("gen_ai.system",         "vertex_ai"),
         _sv("gen_ai.operation.name", "invoke_agent"),
         _sv("gen_ai.request.model",  _model),
+        _sv("gen_ai.response.model", _model),
+        _sv("model",                 _model),
         _sv("llm.model_name",        _model),
         _sv("llm.system",            "vertex_ai"),
         _sv("framework",             "vertex_ai_reasoning_engine"),
         # Session / conversation
         _sv("thread.id",             session_id),
         _sv("conversation.id",       session_id),
+        _sv("session.id",            session_id),
         _sv("langfuse.session.id",   session_id),
         _sv("langfuse.user.id",      user_id),
         _sv("message.id",            message_id),
         _sv("environment.name",      environment),
+        _sv("environment.id",        environment),
+        _sv("workspace.id",          _workspace_id),
+        _sv("instance.id",           tenant_id),
+        # WXO facet attributes — tag generation and routing
+        _sv("wxo.facet.tenant_id",    tenant_id),
+        _sv("wxo.facet.workspace_id", _workspace_id),
+        _sv("wxo.facet.agent_id",     agent_id),
+        _sv("wxo.facet.workflow_id",  span_name),
+        _sv("wxo.channel.name",       "external_agent"),
+        _sv("wxo.channel.type",       "text"),
+        # Langfuse trace-level markers
+        _sv("langfuse.internal.as_root", "true"),
+        _sv("langfuse.trace.name",    span_name),
+        _sv("langfuse.tags",          _langfuse_tags),
+        _sv("global_transaction_id",  trace_id),
         _sv("is.root",               "true"),
         # Primary I/O — server enrichment reads gen_ai.input/output.messages and
         # appends langfuse.observation.input / output.  Do NOT pre-set them here.
         _sv("gen_ai.input.messages",  _json.dumps([{"role": "user",      "content": prompt[:2000]}])),
         _sv("gen_ai.output.messages", _json.dumps([{"role": "assistant", "content": response[:2000]}])),
+        # Structured WXO message envelope
+        _sv("gen_ai.message.input",   _input_envelope),
         # Flat-string copies / backwards-compat aliases
         _sv("gen_ai.prompt",         prompt[:2000]),
         _sv("gen_ai.completion",     response[:2000]),
@@ -397,7 +463,6 @@ def _post_trace(
         _sv("output.value",          response[:2000]),
         _sv("input",                 prompt[:2000]),
         _sv("output",                response[:2000]),
-        _sv("langfuse.trace.name",   span_name),
         # Status
         _sv("agent.execution.status", "error" if is_error else "success"),
         _sv("agent.business_outcome", "failed" if is_error else "success"),
@@ -435,6 +500,21 @@ def _post_trace(
             _sv("error.message", error_msg[:4000]),
         ]
 
+    # ── Reasoning step events on root span (gen_ai.reasoning) ─────────────────
+    _reasoning_steps = reasoning_steps or []
+    _step_events: list[dict] = []
+    for _step_text in _reasoning_steps:
+        if _step_text:
+            _step_events.append({
+                "name": "gen_ai.reasoning",
+                "timeUnixNano": start_ns,
+                "attributes": [
+                    _sv("gen_ai.reasoning.content", str(_step_text)[:4000]),
+                    _sv("langfuse.step.type",        "reasoning"),
+                    _sv("langfuse.step.name",        f"generate_content {_model}"),
+                ],
+            })
+
     # ── Root span ─────────────────────────────────────────────────────────────
     root_span = {
         "traceId":           trace_id,
@@ -445,6 +525,7 @@ def _post_trace(
         "endTimeUnixNano":   end_ns,
         "status":            {"code": 2 if is_error else 0},
         "attributes":        attributes,
+        **( {"events": _step_events} if _step_events else {}),
     }
 
     # ── Synthetic child tree: call_llm → generate_content <model> ─────────────
@@ -462,7 +543,7 @@ def _post_trace(
     _gen_start = _llm_start + max(500_000, (_llm_end - _llm_start) // 20)
     _gen_end   = _llm_end   - max(500_000, (_llm_end - _llm_start) // 20)
     _llm_attrs = [
-        _sv("openinference.span.kind",         "LLM"),
+        _sv("openinference.span.kind",         "CHAIN"),
         _sv("gen_ai.system",                   "vertex_ai"),
         _sv("gen_ai.operation.name",           "chat"),
         _sv("gen_ai.request.model",            _model),
@@ -551,8 +632,8 @@ def _post_trace(
                 _ta.append(_sv("tool.parameters", str(_tc["input"])[:2000]))
                 _ta.append(_sv("input.value",     str(_tc["input"])[:2000]))
             if _tc.get("output"):
+                # NB: no output.value on TOOL spans — WXO drops the span.
                 _ta.append(_sv("tool.output",  str(_tc["output"])[:2000]))
-                _ta.append(_sv("output.value", str(_tc["output"])[:2000]))
             spans.append({
                 "traceId":           trace_id, "spanId": _sid,
                 "parentSpanId":      parent_id,
@@ -585,19 +666,24 @@ def _post_trace(
     payload = {
         "resourceSpans": [{
             "resource": {"attributes": [
-                _sv("service.name",           agent_name),
-                _sv("service.version",        "1.0.0"),
-                _sv("tenant.id",              tenant_id),
-                _sv("agent.id",               agent_id),
-                _sv("agent.name",             agent_name),
-                _sv("gen_ai.agent.id",        agent_id),
-                _sv("gen_ai.agent.name",      agent_name),
-                _sv("wxo.agent.id",           agent_id),
-                _sv("wxo.tenant.id",          tenant_id),
-                _sv("environment.name",       environment),
-                _sv("deployment.environment", environment),
+                _sv("service.name",              agent_name),
+                _sv("service.version",           "1.0.0"),
+                _sv("telemetry.sdk.language",    "python"),
+                _sv("telemetry.sdk.name",        "opentelemetry"),
+                _sv("telemetry.sdk.version",     "1.0.0"),
+                _sv("application",               agent_name),
+                _sv("tenant.id",                 tenant_id),
+                _sv("agent.id",                  agent_id),
+                _sv("agent.name",                agent_name),
+                _sv("agent.display_name",        agent_name),
+                _sv("gen_ai.agent.id",           agent_id),
+                _sv("gen_ai.agent.name",         agent_name),
+                _sv("wxo.agent.id",              agent_id),
+                _sv("wxo.tenant.id",             tenant_id),
+                _sv("environment.name",          environment),
+                _sv("deployment.environment",    environment),
             ]},
-            "scopeSpans": [{"scope": {"name": "a2a-python-sdk", "version": "2.0.0"}, "spans": spans}],
+            "scopeSpans": [{"scope": {"name": "wxo-universal-forwarder", "version": "2.0.0"}, "spans": spans}],
         }]
     }
 
