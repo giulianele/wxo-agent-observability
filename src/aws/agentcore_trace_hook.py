@@ -157,14 +157,6 @@ _pending_traces: dict[str, dict] = {}
 _PENDING_MAX_ENTRIES = 50
 _INTER_TURN_GAP_S = 10.0   # seconds — gap that signals end of a turn
 
-# Per-session cumulative input-token tracker.
-# Strands/Bedrock reports gen_ai.usage.input_tokens as the TOTAL context window
-# size (history + new turn), not just the new turn's tokens.  We subtract the
-# previous turn's cumulative count so WXO sees per-turn input tokens only.
-# Keyed by session_id; capped at _PENDING_MAX_ENTRIES entries.
-_session_input_tokens: dict[str, int] = {}
-
-
 def _get_param(name: str) -> str:
     """Read a flat SSM parameter (legacy path: /wxo-agent/<name>)."""
     key = f"{SSM_PREFIX}/{name}"
@@ -416,6 +408,56 @@ def _post_to_wxo(payload: dict, bearer_token: str, agent_id: str, tenant_id: str
         raise RuntimeError(f"WXO POST failed ({exc.code}): {exc.read().decode()}") from exc
     except URLError as exc:
         raise RuntimeError(f"WXO POST failed: {exc.reason}") from exc
+
+
+def _post_scores_to_wxo(
+    scores: list[dict],
+    bearer_token: str,
+    agent_id: str,
+    agent_name: str,
+    trace_id: str,
+    tenant_id: str,
+    export_url: str,
+) -> None:
+    """POST evaluation scores to the WXO scores endpoint.
+
+    Derives the scores URL from *export_url* by replacing
+    ``inject/traces`` with ``inject/scores``.  Silently skips when
+    *scores* is empty or the URL cannot be derived.
+    """
+    if not scores:
+        return
+    scores_url = export_url.replace("inject/traces", "inject/scores")
+    if scores_url == export_url:
+        logger.warning("[WXO] Cannot derive scores URL from export_url — skipping score POST")
+        return
+
+    stamped: list[dict] = []
+    for sc in scores:
+        entry = dict(sc)
+        entry.setdefault("traceId",    trace_id)
+        entry.setdefault("agentId",    agent_id)
+        entry.setdefault("agentName",  agent_name)
+        stamped.append(entry)
+
+    body = json.dumps({"scores": stamped}).encode()
+    headers = {
+        "Authorization":                f"Bearer {bearer_token}",
+        "Content-Type":                 "application/json",
+        "User-Agent":                   "curl/7.68.0",
+        "x-ibm-agent-id":               agent_id,
+        "x-langfuse-ingestion-version": "4",
+    }
+    if _DEPLOYMENT_MODE == "cloud" and tenant_id:
+        headers["x-ibm-tenant-id"] = tenant_id
+        headers["x-tenant-id"]     = tenant_id
+    ctx = _cpd_ssl_context() if _DEPLOYMENT_MODE == "cpd" else ssl.create_default_context()
+    req = Request(scores_url, data=body, headers=headers, method="POST")
+    try:
+        with urlopen(req, timeout=30, context=ctx) as resp:
+            logger.info(f"[WXO] scores POST {resp.status} trace_id={trace_id} n={len(stamped)}")
+    except Exception as exc:
+        logger.warning(f"[WXO] scores POST failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -1305,6 +1347,9 @@ def _build_wxo_payload(
     # spans so the token counts reconcile with what is shown as input.
     # Falls back to prompt when empty.
     full_prompt:        str = "",
+    # Reasoning / thinking steps — each string becomes a gen_ai.reasoning span event
+    # on the root span, matching the ``steps`` shape emitted by wxo-server LangGraph.
+    reasoning_steps:    list | None = None,
 ) -> dict:
     """Build a WXO OTLP payload with a full 4-level span tree:
 
@@ -1346,34 +1391,100 @@ def _build_wxo_payload(
     llm_input_messages  = json.dumps([{"role": "user",      "content": _llm_input}])
     llm_output_messages = output_messages
 
+    # Structured WXO message envelope — matches the shape emitted by wxo-server's
+    # LangGraph pipeline so the Langfuse UI renders a rich input object on the trace.
+    _input_envelope = json.dumps({
+        "role": "user",
+        "content": prompt,
+        "mentions": None,
+        "document_ids": None,
+        "parent_message_id": None,
+        "additional_properties": {
+            "wxa_message": None,
+            "display_properties": None,
+            "tool_calls": None,
+            "tool_call_id": None,
+            "tool_name": None,
+            "wxo_connection_status": None,
+            "log_id": None,
+            "captured_logs": None,
+            "is_interrupt": False,
+            "tool_flow_properties": None,
+            "architect_conversational_state": None,
+            "current_workflow": None,
+            "metadata": None,
+            "agent_id": None,
+            "a2a_task_completed": False,
+            "error_code": None,
+        },
+        "assistant_id": None,
+        "context": None,
+        "step_history": None,
+        "message_state": None,
+        "log_id": None,
+        "meta": None,
+        "user_defined": None,
+        "session_id": session_id,
+        "trace_id": None,
+    })
+
+    workspace_id = "00000000-0000-0000-0000-000000000001"
+    _langfuse_tags = json.dumps([
+        f"agent_id:{agent_id}",
+        f"environment:{environment}",
+        f"tenant_id:{tenant_id}",
+        f"workspace_id:{workspace_id}",
+    ])
+
     # ── Root span: invoke_agent (AGENT kind) ─────────────────────────────────
     root_attrs = [
         _sv("agent.id",              agent_id),
         _sv("agent.name",            agent_name),
         _sv("agent.display_name",    agent_display_name),
+        _sv("agent.version",         "1"),
         _sv("gen_ai.operation.name", "invoke_agent"),
         _sv("gen_ai.agent.id",       agent_id),
         _sv("gen_ai.agent.name",     agent_name),
         _sv("thread.id",             session_id),
         _sv("conversation.id",       session_id),
+        _sv("session.id",            session_id),
         _sv("langfuse.session.id",   session_id),
         _sv("langfuse.user.id",      user_id),
         _sv("message.id",            message_id),
         _sv("environment.name",      environment),
+        _sv("environment.id",        environment),
+        _sv("workspace.id",          workspace_id),
+        _sv("instance.id",           tenant_id),
+        _sv("tenant.id",             tenant_id),
+        # WXO facet attributes — tag generation and routing
+        _sv("wxo.facet.tenant_id",    tenant_id),
+        _sv("wxo.facet.workspace_id", workspace_id),
+        _sv("wxo.facet.agent_id",     agent_id),
+        _sv("wxo.facet.workflow_id",  span_name),
+        _sv("wxo.channel.name",       "external_agent"),
+        _sv("wxo.channel.type",       "text"),
+        # Langfuse trace-level markers
+        _sv("langfuse.internal.as_root", "true"),
+        _sv("langfuse.trace.name",    span_name),
+        _sv("langfuse.tags",          _langfuse_tags),
+        _sv("is.root",                "true"),
+        _sv("global_transaction_id",  trace_id),
         # Primary I/O for server enrichment
         _sv("gen_ai.input.messages",  input_messages),
         _sv("gen_ai.output.messages", output_messages),
+        # Structured WXO message envelope — gives the Langfuse trace a rich input object
+        _sv("gen_ai.message.input",   _input_envelope),
         # Flat-string copies for ClickHouse / backwards-compat
         _sv("input.value",  prompt),
         _sv("output.value", response_text),
         _sv("gen_ai.task.input",   prompt),
         _sv("gen_ai.task.output",  response_text),
-        _sv("langfuse.trace.name", span_name),
-        _sv("is.root",             "true"),
         _sv("input",  prompt),
         _sv("output", response_text),
-        _sv("llm.model_name", model_name),
-        _sv("llm.system",     "aws_bedrock"),
+        _sv("llm.model_name",        model_name),
+        _sv("model",                 model_name),
+        _sv("gen_ai.response.model", model_name),
+        _sv("llm.system",            "aws_bedrock"),
         _sv("agent.execution.status", "error" if is_error else "success"),
         _sv("agent.business_outcome", "failed" if is_error else "success"),
         _sv("framework",              "aws_bedrock_agentcore"),
@@ -1383,13 +1494,21 @@ def _build_wxo_payload(
         _sv("gen_ai.system",           "aws_bedrock_agentcore"),
         _sv("gen_ai.request.model",    model_name),
         _iv("latency_ms",              latency_ms),
-        # Token totals on root for ClickHouse rollup
+        # Token counts on root for ClickHouse rollup
         _iv("gen_ai.usage.input_tokens",      input_tokens),
         _iv("gen_ai.usage.output_tokens",     output_tokens),
+        _iv("gen_ai.usage.prompt_tokens",     input_tokens),
+        _iv("gen_ai.usage.completion_tokens", output_tokens),
         _iv("llm.usage.prompt_tokens",        input_tokens),
         _iv("llm.usage.completion_tokens",    output_tokens),
         _iv("llm.usage.total_tokens",         total_tokens),
+        _iv("llm.token_count.prompt",         input_tokens),
+        _iv("llm.token_count.completion",     output_tokens),
+        _iv("llm.token_count.total",          total_tokens),
         _sv("provided_usage_details", json.dumps({
+            "input": input_tokens, "output": output_tokens, "total": total_tokens,
+        })),
+        _sv("langfuse.observation.usage_details", json.dumps({
             "input": input_tokens, "output": output_tokens, "total": total_tokens,
         })),
     ]
@@ -1398,6 +1517,21 @@ def _build_wxo_payload(
     if is_error and error_msg:
         root_attrs.append(_sv("error.type",    "AgentCoreError"))
         root_attrs.append(_sv("error.message", error_msg[:4000]))
+
+    # Reasoning step events — each entry becomes a ``steps`` row in the Langfuse
+    # trace, matching the shape emitted by WXO's internal LangGraph pipeline.
+    _step_events: list[dict] = []
+    for _step_text in (reasoning_steps or []):
+        if _step_text:
+            _step_events.append({
+                "name": "gen_ai.reasoning",
+                "timeUnixNano": start_ns,
+                "attributes": [
+                    _sv("gen_ai.reasoning.content", str(_step_text)[:4000]),
+                    _sv("langfuse.step.type",        "reasoning"),
+                    _sv("langfuse.step.name",        f"generate_content {model_name}"),
+                ],
+            })
 
     root_span = {
         "traceId":            trace_id,
@@ -1408,6 +1542,7 @@ def _build_wxo_payload(
         "endTimeUnixNano":    end_ns,
         "status":             {"code": 2 if is_error else 0},
         "attributes":         root_attrs,
+        **({"events": _step_events} if _step_events else {}),
     }
 
     # ── call_llm span (LLM wrapper child of root) ─────────────────────────────
@@ -1426,7 +1561,7 @@ def _build_wxo_payload(
         "endTimeUnixNano":    llm_end,
         "status":             {"code": 0},
         "attributes": [
-            _sv("openinference.span.kind", "LLM"),
+            _sv("openinference.span.kind", "CHAIN"),
             _sv("gen_ai.request.model",    model_name),
             _sv("llm.model_name",          model_name),
             _sv("gen_ai.system",           "aws_bedrock_agentcore"),
@@ -1524,8 +1659,8 @@ def _build_wxo_payload(
                 _ta.append(_sv("tool.parameters", str(_tc["input"])[:2000]))
                 _ta.append(_sv("input.value",     str(_tc["input"])[:2000]))
             if _tc.get("output"):
+                # NB: no output.value on TOOL spans — WXO drops the span.
                 _ta.append(_sv("tool.output",  str(_tc["output"])[:2000]))
-                _ta.append(_sv("output.value", str(_tc["output"])[:2000]))
             spans.append({
                 "traceId":           trace_id, "spanId": _sid,
                 "parentSpanId":      parent_id,
@@ -1563,18 +1698,22 @@ def _build_wxo_payload(
     return {
         "resourceSpans": [{
             "resource": {"attributes": [
-                _sv("service.name",           agent_name),
-                _sv("service.version",        "1.0.0"),
-                _sv("tenant.id",              tenant_id),
-                _sv("agent.id",               agent_id),
-                _sv("agent.name",             agent_name),
-                _sv("agent.display_name",     agent_display_name),
-                _sv("gen_ai.agent.id",        agent_id),
-                _sv("gen_ai.agent.name",      agent_name),
-                _sv("environment.name",       environment),
-                _sv("deployment.environment", environment),
+                _sv("service.name",              agent_name),
+                _sv("service.version",           "1.0.0"),
+                _sv("telemetry.sdk.language",    "python"),
+                _sv("telemetry.sdk.name",        "opentelemetry"),
+                _sv("telemetry.sdk.version",     "1.0.0"),
+                _sv("application",               agent_name),
+                _sv("tenant.id",                 tenant_id),
+                _sv("agent.id",                  agent_id),
+                _sv("agent.name",                agent_name),
+                _sv("agent.display_name",        agent_display_name),
+                _sv("gen_ai.agent.id",           agent_id),
+                _sv("gen_ai.agent.name",         agent_name),
+                _sv("environment.name",          environment),
+                _sv("deployment.environment",    environment),
             ]},
-            "scopeSpans": [{"scope": {"name": "wxo-agentcore-hook", "version": "2.0.0"}, "spans": spans}],
+            "scopeSpans": [{"scope": {"name": "wxo-universal-forwarder", "version": "2.0.0"}, "spans": spans}],
         }]
     }
 
@@ -1745,6 +1884,7 @@ def lambda_handler(event: dict, context) -> dict:
         user_id       = ""
         model_name    = ""
         tool_calls: list = []
+        reasoning_steps: list = []
         user_text_hint: str = ""
         # Set to True when a Strands invoke_agent span is found — the push is then
         # the definitive final push of the turn and is shipped with zero delay.
@@ -1835,6 +1975,28 @@ def lambda_handler(event: dict, context) -> dict:
                 or bool(attrs_dict.get("gen_ai.tool.name"))
             )
 
+        def _tool_io_from_events(events: list, as_dict: bool) -> tuple:
+            """Tool input / output from a Strands execute_tool span's events.
+
+            Strands records the tool input in ``gen_ai.tool.message`` (content) and the
+            result in ``gen_ai.choice`` (message) rather than as span attributes.
+            """
+            t_in, t_out = "", ""
+            for ev in events or []:
+                ea = (ev.get("attributes", {}) if as_dict else
+                      {a["key"]: list(a["value"].values())[0] for a in ev.get("attributes", [])})
+                if ev.get("name") == "gen_ai.tool.message":
+                    t_in = str(ea.get("content") or "")
+                elif ev.get("name") == "gen_ai.choice":
+                    raw = ea.get("message") or ""
+                    try:
+                        blocks = json.loads(raw) if isinstance(raw, str) else raw
+                        texts = [b.get("text", "") for b in blocks if isinstance(b, dict)]
+                        t_out = "\n".join(t for t in texts if t) or str(raw)
+                    except Exception:
+                        t_out = str(raw)
+            return t_in, t_out
+
         def _build_tool_tree_proto(rs_list: list) -> list:
             """Build nested tool_calls list from proto-decoded span list.
 
@@ -1861,10 +2023,11 @@ def lambda_handler(event: dict, context) -> dict:
                 sp = span_by_id[sid]
                 attrs = sp["attributes"]
                 n = sp["name"]
+                _ev_in, _ev_out = _tool_io_from_events(sp.get("events"), True)
                 tc_by_id[sid] = {
                     "name":     (attrs.get("tool.name") or attrs.get("gen_ai.tool.name") or n),
-                    "input":    str(attrs.get("tool.parameters") or attrs.get("input.value") or attrs.get("tool.input") or ""),
-                    "output":   str(attrs.get("tool.output") or attrs.get("output.value") or ""),
+                    "input":    str(attrs.get("tool.parameters") or attrs.get("input.value") or attrs.get("tool.input") or _ev_in),
+                    "output":   str(attrs.get("tool.output") or attrs.get("output.value") or _ev_out),
                     "start_ns": sp["startTimeUnixNano"],
                     "end_ns":   sp["endTimeUnixNano"],
                     "is_error": sp.get("status", {}).get("code") == 2,
@@ -1906,10 +2069,11 @@ def lambda_handler(event: dict, context) -> dict:
                 sp = span_by_id[sid]
                 attrs = sp["_attrs_cache"]
                 n = sp.get("name", "")
+                _ev_in, _ev_out = _tool_io_from_events(sp.get("events"), False)
                 tc_by_id[sid] = {
                     "name":     (attrs.get("tool.name") or attrs.get("gen_ai.tool.name") or n),
-                    "input":    str(attrs.get("tool.parameters") or attrs.get("input.value") or attrs.get("tool.input") or ""),
-                    "output":   str(attrs.get("tool.output") or attrs.get("output.value") or ""),
+                    "input":    str(attrs.get("tool.parameters") or attrs.get("input.value") or attrs.get("tool.input") or _ev_in),
+                    "output":   str(attrs.get("tool.output") or attrs.get("output.value") or _ev_out),
                     "start_ns": int(sp.get("startTimeUnixNano") or 0),
                     "end_ns":   int(sp.get("endTimeUnixNano") or 0),
                     "is_error": sp.get("status", {}).get("code") == 2,
@@ -2005,6 +2169,34 @@ def lambda_handler(event: dict, context) -> dict:
                                             _cleaned = _clean_prompt(_fp)
                                             if _cleaned and _cleaned != "(user question not captured in ADOT span)":
                                                 prompt = _cleaned
+                                elif ev_name in ("gen_ai.reasoning", "gen_ai.thinking",
+                                                 "anthropic.thinking", "model.reasoning"):
+                                    _r = (ev_attrs.get("gen_ai.reasoning.content")
+                                          or ev_attrs.get("thinking")
+                                          or ev_attrs.get("content") or "")
+                                    if _r:
+                                        reasoning_steps.append(str(_r))
+                                elif ev_name == "gen_ai.choice" and ev_attrs.get("finish_reason") == "interrupt":
+                                    # The turn stopped at a tool request (harness inline tool).
+                                    # The message is the raw interrupt record, not an answer:
+                                    # record the requested tool call and leave response_text
+                                    # to the model's own chat-span output.
+                                    try:
+                                        import ast as _ast
+                                        for _it in _ast.literal_eval(str(ev_attrs.get("message") or "[]")):
+                                            _tu = ((_it or {}).get("reason") or {}).get("toolUse")
+                                            if _tu and not tool_calls:
+                                                tool_calls.append({
+                                                    "name":     str(_tu.get("name") or ""),
+                                                    "input":    json.dumps(_tu.get("input") or {}),
+                                                    "output":   "",
+                                                    "start_ns": 0,
+                                                    "end_ns":   0,
+                                                    "is_error": False,
+                                                    "sub_calls": [],
+                                                })
+                                    except Exception:
+                                        pass
                                 elif ev_name == "gen_ai.choice":
                                     raw_out = (ev_attrs.get("gen_ai.completion")
                                                or ev_attrs.get("message")
@@ -2128,6 +2320,13 @@ def lambda_handler(event: dict, context) -> dict:
                                         raw = ev_attrs.get("content", "")
                                         _p = _extract_input_text(raw) or (str(raw) if raw else "")
                                         all_user_texts.append(_p)
+                                    elif ev_name in ("gen_ai.reasoning", "gen_ai.thinking",
+                                                     "anthropic.thinking", "model.reasoning"):
+                                        _r = (ev_attrs.get("gen_ai.reasoning.content")
+                                              or ev_attrs.get("thinking")
+                                              or ev_attrs.get("content") or "")
+                                        if _r:
+                                            reasoning_steps.append(str(_r))
                                     elif ev_name == "gen_ai.choice" and not response_text:
                                         raw = ev_attrs.get("message", "")
                                         response_text = _extract_text_field(raw) or (str(raw) if raw else "")
@@ -2230,6 +2429,13 @@ def lambda_handler(event: dict, context) -> dict:
                                     raw = ev_attrs.get("content", "")
                                     _p = _extract_input_text(raw) or (str(raw) if raw else "")
                                     _json_user_texts.append(_p)
+                                elif ev_name in ("gen_ai.reasoning", "gen_ai.thinking",
+                                                 "anthropic.thinking", "model.reasoning"):
+                                    _r = (ev_attrs.get("gen_ai.reasoning.content")
+                                          or ev_attrs.get("thinking")
+                                          or ev_attrs.get("content") or "")
+                                    if _r:
+                                        reasoning_steps.append(str(_r))
                                 elif ev_name == "gen_ai.choice" and not response_text:
                                     raw = ev_attrs.get("message", "")
                                     response_text = _extract_text_field(raw) or (str(raw) if raw else "")
@@ -2317,46 +2523,41 @@ def lambda_handler(event: dict, context) -> dict:
                 model_name=model_name, trace_id="",
                 tool_calls=tool_calls,
                 full_prompt=full_prompt,
+                reasoning_steps=reasoning_steps or None,
             )
 
         def _ship(args: dict) -> str:
             _tc = args.get("tool_calls") or []
-            # ── Per-turn input token delta ────────────────────────────────────
-            # Strands reports gen_ai.usage.input_tokens as the cumulative context
-            # window (history + current turn), not just the new turn's tokens.
-            # Subtract the previous turn's cumulative count so WXO sees per-turn
-            # input tokens.  Output tokens are already per-turn so they're untouched.
-            _sid = args.get("session_id", "")
-            _raw_input = args["input_tokens"]
-            if _sid and _raw_input > 0:
-                _prev = _session_input_tokens.get(_sid, 0)
-                _delta = max(1, _raw_input - _prev)
-                _session_input_tokens[_sid] = _raw_input   # update cumulative
-                # Evict oldest entries to cap memory
-                if len(_session_input_tokens) > _PENDING_MAX_ENTRIES:
-                    _oldest = next(iter(_session_input_tokens))
-                    del _session_input_tokens[_oldest]
-                args = dict(args)   # shallow copy — don't mutate the caller's dict
-                args["input_tokens"]  = _delta
-                args["total_tokens"]  = _delta + args["output_tokens"]
-                logger.info(
-                    f"[HOOK] extracted: prompt={args['prompt'][:80]!r} "
-                    f"response={args['response_text'][:80]!r} "
-                    f"tokens(raw={_raw_input} delta={_delta})/{args['output_tokens']} "
-                    f"latency={(args['end_ns'] - args['start_ns'])//1_000_000}ms "
-                    f"tool_calls={len(_tc)}"
-                )
-            else:
-                logger.info(
-                    f"[HOOK] extracted: prompt={args['prompt'][:80]!r} "
-                    f"response={args['response_text'][:80]!r} "
-                    f"tokens={args['input_tokens']}/{args['output_tokens']} "
-                    f"latency={(args['end_ns'] - args['start_ns'])//1_000_000}ms "
-                    f"tool_calls={len(_tc)}"
-                )
+            # Token counts are reported as the model billed them for this call
+            # (each harness invocation sends its full context window).
+            logger.info(
+                f"[HOOK] extracted: prompt={args['prompt'][:80]!r} "
+                f"response={args['response_text'][:80]!r} "
+                f"tokens={args['input_tokens']}/{args['output_tokens']} "
+                f"latency={(args['end_ns'] - args['start_ns'])//1_000_000}ms "
+                f"tool_calls={len(_tc)}"
+            )
             _bearer = _fetch_token(*_token_args)
             _pl = _build_wxo_payload(**args)
-            return _post_to_wxo(_pl, _bearer, args["agent_id"], tenant_id, export_url)
+            _job = _post_to_wxo(_pl, _bearer, args["agent_id"], tenant_id, export_url)
+            # Extract eval scores from span attributes and post to WXO scores endpoint
+            _scores: list[dict] = []
+            for _key, _val in args.items():
+                if isinstance(_key, str) and _key.startswith(("eval.", "score.", "langfuse.score.")):
+                    try:
+                        _scores.append({"name": _key, "value": float(_val)})
+                    except (TypeError, ValueError):
+                        pass
+            if _scores:
+                _tid = (_pl.get("resourceSpans", [{}])[0]
+                           .get("scopeSpans", [{}])[0]
+                           .get("spans", [{}])[0]
+                           .get("traceId", ""))
+                _post_scores_to_wxo(
+                    _scores, _bearer, args["agent_id"], args["agent_name"],
+                    _tid, tenant_id, export_url,
+                )
+            return _job
 
         now = time.time()
 
