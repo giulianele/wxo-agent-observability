@@ -296,6 +296,9 @@ def build_otlp_payload(
     # When None (default) one synthetic retrieval span is added automatically.
     # Pass [] explicitly to suppress synthetic retrieval.
     retrieval_calls: list | None = None,
+    # Reasoning / thinking steps — each string becomes a gen_ai.reasoning span event
+    # on the root span, matching the ``steps`` shape emitted by wxo-server LangGraph.
+    reasoning_steps: list[str] | None = None,
 ) -> dict:
     """
     Build a WXO-compatible synthetic OTLP JSON payload containing a root span
@@ -333,11 +336,57 @@ def build_otlp_payload(
     input_messages  = json.dumps([{"role": "user",      "content": prompt}])
     output_messages = json.dumps([{"role": "assistant", "content": response}])
 
+    # Structured WXO message envelope — matches the shape emitted by wxo-server's
+    # LangGraph pipeline so the Langfuse UI renders a rich input object on the trace.
+    _input_envelope = json.dumps({
+        "role": "user",
+        "content": prompt,
+        "mentions": None,
+        "document_ids": None,
+        "parent_message_id": None,
+        "additional_properties": {
+            "wxa_message": None,
+            "display_properties": None,
+            "tool_calls": None,
+            "tool_call_id": None,
+            "tool_name": None,
+            "wxo_connection_status": None,
+            "log_id": None,
+            "captured_logs": None,
+            "is_interrupt": False,
+            "tool_flow_properties": None,
+            "architect_conversational_state": None,
+            "current_workflow": None,
+            "metadata": None,
+            "agent_id": None,
+            "a2a_task_completed": False,
+            "error_code": None,
+        },
+        "assistant_id": None,
+        "context": None,
+        "step_history": None,
+        "message_state": None,
+        "log_id": None,
+        "meta": None,
+        "user_defined": None,
+        "session_id": _session_id,
+        "trace_id": None,
+    })
+
+    _workspace_id = "00000000-0000-0000-0000-000000000001"
+    _langfuse_tags = json.dumps([
+        f"agent_id:{agent_id}",
+        f"environment:{environment}",
+        f"tenant_id:{tenant_id}",
+        f"workspace_id:{_workspace_id}",
+    ])
+
     attributes: list = [
         # Agent identity
         _sv("agent.id",              agent_id),
         _sv("agent.name",            agent_name),
         _sv("agent.display_name",    agent_name),
+        _sv("agent.version",         "1"),
         _sv("gen_ai.operation.name", "invoke_agent"),
         _sv("gen_ai.agent.id",       agent_id),
         _sv("gen_ai.agent.name",     agent_name),
@@ -349,19 +398,36 @@ def build_otlp_payload(
         _sv("langfuse.user.id",      _user_id),
         _sv("message.id",            _message_id),
         _sv("environment.name",      environment),
+        _sv("environment.id",        environment),
+        _sv("workspace.id",          _workspace_id),
+        _sv("instance.id",           tenant_id),
+        _sv("tenant.id",             tenant_id),
+        # WXO facet attributes — tag generation and routing
+        _sv("wxo.facet.tenant_id",    tenant_id),
+        _sv("wxo.facet.workspace_id", _workspace_id),
+        _sv("wxo.facet.agent_id",     agent_id),
+        _sv("wxo.facet.workflow_id",  _span_name),
+        _sv("wxo.channel.name",       "external_agent"),
+        _sv("wxo.channel.type",       "text"),
+        # Langfuse trace-level markers
+        _sv("langfuse.internal.as_root", "true"),
+        _sv("langfuse.trace.name",    _span_name),
+        _sv("langfuse.tags",          _langfuse_tags),
+        _sv("is.root",                "true"),
+        _sv("global_transaction_id",  _trace_id),
         # Primary I/O — server enrichment (_enrich_external_agent_json) reads these and
         # appends langfuse.observation.input / langfuse.observation.output from them.
         # Do NOT pre-set langfuse.observation.* here — the server appends them last and
         # Langfuse uses the last duplicate value, so pre-setting would be overwritten anyway.
         _sv("gen_ai.input.messages",  input_messages),
         _sv("gen_ai.output.messages", output_messages),
+        # Structured WXO message envelope — gives the Langfuse trace a rich input object
+        _sv("gen_ai.message.input",   _input_envelope),
         # Flat-string copies for ClickHouse / backwards-compat
         _sv("input.value",           prompt),
         _sv("output.value",          response),
         _sv("gen_ai.task.input",     prompt),
         _sv("gen_ai.task.output",    response),
-        _sv("langfuse.trace.name",   _span_name),
-        _sv("is.root",               "true"),
         _sv("input",                 prompt),
         _sv("output",                response),
         # Platform
@@ -409,6 +475,21 @@ def build_otlp_payload(
     if extra_attributes:
         attributes.extend(extra_attributes)
 
+    # Reasoning step events — each entry becomes a ``steps`` row in the Langfuse
+    # trace, matching the shape emitted by WXO's internal LangGraph pipeline.
+    _step_events: list[dict] = []
+    for _step_text in (reasoning_steps or []):
+        if _step_text:
+            _step_events.append({
+                "name": "gen_ai.reasoning",
+                "timeUnixNano": start_ns,
+                "attributes": [
+                    _sv("gen_ai.reasoning.content", str(_step_text)[:4000]),
+                    _sv("langfuse.step.type",        "reasoning"),
+                    _sv("langfuse.step.name",        f"generate_content {_model_name}"),
+                ],
+            })
+
     root_span = {
         "traceId":            _trace_id,
         "spanId":             _span_id,
@@ -418,6 +499,7 @@ def build_otlp_payload(
         "endTimeUnixNano":    end_ns,
         "status":             {"code": 2 if is_error else 0},
         "attributes":         attributes,
+        **({"events": _step_events} if _step_events else {}),
     }
 
     # ── Synthetic child span tree: call_llm → generate_content <model> ────────
@@ -538,8 +620,8 @@ def build_otlp_payload(
                     _ta.append(_sv("tool.parameters", str(_tc["input"])[:2000]))
                     _ta.append(_sv("input.value",     str(_tc["input"])[:2000]))
                 if _tc.get("output"):
+                    # NB: no output.value on TOOL spans — WXO drops the span.
                     _ta.append(_sv("tool.output",  str(_tc["output"])[:2000]))
-                    _ta.append(_sv("output.value", str(_tc["output"])[:2000]))
                 target.append({
                     "traceId":           _trace_id, "spanId": _sid,
                     "parentSpanId":      parent_id,
@@ -595,18 +677,22 @@ def build_otlp_payload(
     return {
         "resourceSpans": [{
             "resource": {"attributes": [
-                _sv("service.name",           agent_name),
-                _sv("service.version",        "1.0.0"),
-                _sv("tenant.id",              tenant_id),
-                _sv("agent.id",               agent_id),
-                _sv("agent.name",             agent_name),
-                _sv("agent.display_name",     agent_name),
-                _sv("gen_ai.agent.id",        agent_id),
-                _sv("gen_ai.agent.name",      agent_name),
-                _sv("environment.name",       environment),
-                _sv("deployment.environment", environment),
+                _sv("service.name",              agent_name),
+                _sv("service.version",           "1.0.0"),
+                _sv("telemetry.sdk.language",    "python"),
+                _sv("telemetry.sdk.name",        "opentelemetry"),
+                _sv("telemetry.sdk.version",     "1.0.0"),
+                _sv("application",               agent_name),
+                _sv("tenant.id",                 tenant_id),
+                _sv("agent.id",                  agent_id),
+                _sv("agent.name",                agent_name),
+                _sv("agent.display_name",        agent_name),
+                _sv("gen_ai.agent.id",           agent_id),
+                _sv("gen_ai.agent.name",         agent_name),
+                _sv("environment.name",          environment),
+                _sv("deployment.environment",    environment),
             ]},
-            "scopeSpans": [{"scope": {"name": "wxo-tracer", "version": "1.0.0"}, "spans": spans}],
+            "scopeSpans": [{"scope": {"name": "wxo-universal-forwarder", "version": "2.0.0"}, "spans": spans}],
         }]
     }
 
@@ -724,8 +810,8 @@ def build_child_span(
             attrs.append(_sv("tool.parameters", tool_input[:2000]))
             attrs.append(_sv("input.value",     tool_input[:2000]))
         if tool_output:
+            # NB: no output.value on TOOL spans — WXO drops the span.
             attrs.append(_sv("tool.output",  tool_output[:2000]))
-            attrs.append(_sv("output.value", tool_output[:2000]))
 
     # ── Caller-supplied extras (can override the above) ───────────────────────
     attrs.extend(attributes or [])
@@ -819,3 +905,61 @@ def post_to_wxo(
             time.sleep(0.5 * (2 ** attempt))   # 0.5 s → 1 s → 2 s
 
     raise last_exc or RuntimeError("WXO POST failed after all retries")
+
+
+def post_scores_to_wxo(
+    scores: list[dict],
+    bearer_token: str,
+    export_url: str,
+    agent_id: str,
+    agent_name: str,
+    trace_id: str,
+    tenant_id: str,
+    logger=None,
+) -> None:
+    """POST evaluation scores to the WXO scores endpoint.
+
+    Derives the scores URL from *export_url* by replacing
+    ``inject/traces`` with ``inject/scores``.  Silently skips when
+    *scores* is empty or the URL cannot be derived.
+
+    Each score dict must contain at least ``name`` and ``value``.
+    ``traceId``, ``agentId``, and ``agentName`` are stamped automatically.
+    """
+    if not scores:
+        return
+    scores_url = export_url.replace("inject/traces", "inject/scores")
+    if scores_url == export_url:
+        if logger:
+            logger.warning("[WXO] Cannot derive scores URL from export_url — skipping score POST")
+        return
+
+    stamped: list[dict] = []
+    for sc in scores:
+        entry = dict(sc)
+        entry.setdefault("traceId",    trace_id)
+        entry.setdefault("agentId",    agent_id)
+        entry.setdefault("agentName",  agent_name)
+        stamped.append(entry)
+
+    payload = {"scores": stamped}
+    data    = json.dumps(payload).encode()
+    headers = {
+        "Authorization":                  f"Bearer {bearer_token}",
+        "Content-Type":                   "application/json",
+        "User-Agent":                     "curl/7.68.0",
+        "x-ibm-agent-id":                 agent_id,
+        "x-langfuse-ingestion-version":   "4",
+    }
+    if tenant_id and deployment_mode() == "cloud":
+        headers["x-ibm-tenant-id"] = tenant_id
+        headers["x-tenant-id"]     = tenant_id
+    ctx = ssl_context()
+    req = Request(scores_url, data=data, headers=headers, method="POST")
+    try:
+        with urlopen(req, timeout=30, context=ctx) as resp:
+            if logger:
+                logger.info(f"[WXO] scores POST {resp.status} trace_id={trace_id} n={len(stamped)}")
+    except Exception as exc:
+        if logger:
+            logger.warning(f"[WXO] scores POST failed: {exc}")
