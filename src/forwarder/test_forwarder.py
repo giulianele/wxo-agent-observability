@@ -8,7 +8,10 @@ import json
 import unittest
 from unittest.mock import MagicMock, patch
 
-from forwarder.forwarder import OtlpForwarder, build_otlp_payload, count_tokens, decode_otlp_protobuf
+from forwarder.forwarder import (
+    OtlpForwarder, build_otlp_payload, count_tokens, decode_otlp_protobuf,
+    post_scores_to_wxo,
+)
 from forwarder.lambda_function import lambda_handler
 
 
@@ -89,6 +92,119 @@ class TestOtlpForwarder(unittest.TestCase):
         self.assertEqual(root["name"], "invoke_agent my_agent")
         self.assertEqual(tool["name"], "lookup_order")
         self.assertEqual(tool["parentSpanId"], spans[2]["spanId"])
+
+    def test_build_otlp_payload_input_envelope(self):
+        """Root span must carry gen_ai.message.input as the WXO structured
+        message envelope object, not a bare prompt string."""
+        payload = build_otlp_payload(
+            agent_id="test-id",
+            agent_name="my_agent",
+            tenant_id="my-tenant",
+            prompt="What is the weather?",
+            response="It is sunny.",
+            session_id="sess-abc",
+        )
+        root_attrs = {
+            a["key"]: a["value"]
+            for a in payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+        }
+        self.assertIn("gen_ai.message.input", root_attrs)
+        envelope = json.loads(root_attrs["gen_ai.message.input"]["stringValue"])
+        self.assertEqual(envelope["role"], "user")
+        self.assertEqual(envelope["content"], "What is the weather?")
+        self.assertEqual(envelope["session_id"], "sess-abc")
+        self.assertIsNone(envelope["trace_id"])
+        self.assertIn("additional_properties", envelope)
+        self.assertFalse(envelope["additional_properties"]["a2a_task_completed"])
+
+    def test_build_otlp_payload_reasoning_steps(self):
+        """Reasoning steps must appear as gen_ai.reasoning events on the root
+        span, matching the Langfuse steps shape WXO's internal pipeline emits."""
+        payload = build_otlp_payload(
+            agent_id="test-id",
+            agent_name="my_agent",
+            tenant_id="my-tenant",
+            prompt="Explain quantum entanglement.",
+            response="Entanglement is ...",
+            reasoning_steps=["First, consider the wave function.", "Then apply Bell's theorem."],
+        )
+        root_span = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+        self.assertIn("events", root_span)
+        events = root_span["events"]
+        self.assertEqual(len(events), 2)
+        e_attrs_0 = {a["key"]: a["value"]["stringValue"] for a in events[0]["attributes"]}
+        self.assertEqual(events[0]["name"], "gen_ai.reasoning")
+        self.assertEqual(e_attrs_0["gen_ai.reasoning.content"], "First, consider the wave function.")
+        self.assertEqual(e_attrs_0["langfuse.step.type"], "reasoning")
+        self.assertIn("generate_content", e_attrs_0["langfuse.step.name"])
+
+    def test_build_otlp_payload_no_reasoning_steps_no_events(self):
+        """When no reasoning_steps are provided, the root span must not have
+        an events key (keeps the wire payload minimal)."""
+        payload = build_otlp_payload(
+            agent_id="test-id",
+            agent_name="my_agent",
+            tenant_id="my-tenant",
+            prompt="Hello",
+            response="Hi",
+        )
+        root_span = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+        self.assertNotIn("events", root_span)
+
+    def test_process_payload_extracts_reasoning_from_span_event(self):
+        """Reasoning events in the incoming OTLP span must be collected and
+        forwarded as gen_ai.reasoning events on the outgoing root span."""
+        captured = []
+
+        def fake_build(**kw):
+            captured.append(kw.get("reasoning_steps"))
+            # Return a minimal valid payload so the forwarder doesn't crash
+            return {
+                "resourceSpans": [{
+                    "resource": {"attributes": []},
+                    "scopeSpans": [{"scope": {}, "spans": []}],
+                }]
+            }
+
+        sample_otlp = {
+            "resourceSpans": [{
+                "resource": {"attributes": [
+                    {"key": "service.name", "value": {"stringValue": "default"}},
+                ]},
+                "scopeSpans": [{
+                    "spans": [{
+                        "traceId": "aabbccdd",
+                        "spanId": "deadbeef",
+                        "name": "invoke_agent",
+                        "startTimeUnixNano": 1_000_000_000,
+                        "endTimeUnixNano":   2_000_000_000,
+                        "attributes": [],
+                        "events": [
+                            {
+                                "name": "gen_ai.reasoning",
+                                "timeUnixNano": 1_100_000_000,
+                                "attributes": [
+                                    {"key": "gen_ai.reasoning.content",
+                                     "value": {"stringValue": "I should check the docs first."}},
+                                ],
+                            }
+                        ],
+                    }]
+                }]
+            }]
+        }
+
+        with patch("forwarder.forwarder.build_otlp_payload", side_effect=fake_build), \
+             patch("forwarder.forwarder.get_bearer_token", return_value="tok"), \
+             patch("forwarder.forwarder.post_to_wxo", return_value="J"):
+            self.forwarder.process_payload(
+                body_bytes=json.dumps(sample_otlp).encode(),
+                content_type="application/json",
+            )
+
+        self.assertEqual(len(captured), 1)
+        self.assertIsNotNone(captured[0])
+        self.assertIn("I should check the docs first.", captured[0])
 
     @patch("forwarder.forwarder.urlopen")
     def test_process_payload_json(self, mock_urlopen):
@@ -381,6 +497,662 @@ class TestOtlpForwarder(unittest.TestCase):
 
         self.assertEqual(ids, [], "anthropic.model_request must never be forwarded standalone")
         self.assertEqual(calls, [])
+
+
+    # ------------------------------------------------------------------ AWS --
+
+    def _make_aws_strands_payload(self):
+        """Minimal AWS Strands flat-format OTLP payload matching real span shape."""
+        return {
+            "resource_attrs": {
+                "telemetry.sdk.language": "python",
+                "telemetry.sdk.name": "opentelemetry",
+                "telemetry.sdk.version": "1.44.0",
+                "aws.agent.runtime.id": "harness_wxoTracingTest-DEqjmm77sf",
+                "wxo.agent.id": "61e315a1-0749-49fc-9972-fd92068fd881",
+                "wxo.agent.name": "wxo_tracing_test",
+                "wxo.environment": "draft",
+                "service.name": "wxo_tracing_test",
+            },
+            "scope_spans": [
+                {
+                    "scope_name": "strands.telemetry.tracer",
+                    "spans": [
+                        {
+                            # subordinate — must not be forwarded
+                            "name": "execute_event_loop_cycle",
+                            "traceId": "6ad3aee9244cc512487ba36768b48bc2",
+                            "spanId": "a949ff33a7d2fca0",
+                            "parentSpanId": "364f93fb93e0d393",
+                            "startTimeUnixNano": 1792257802186443184,
+                            "endTimeUnixNano": 1792257802934339104,
+                            "attributes": {},
+                            "events": [],
+                        },
+                        {
+                            # top-level invocation — must be forwarded
+                            "name": "invoke_agent Strands Agents",
+                            "traceId": "6ad3aee9244cc512487ba36768b48bc2",
+                            "spanId": "364f93fb93e0d393",
+                            "parentSpanId": "1116434f34966702",
+                            "startTimeUnixNano": 1792257801921408925,
+                            "endTimeUnixNano": 1792257802934589978,
+                            "attributes": {
+                                "harness.id": "wxoTracingTest-EQnaAkefWw",
+                                "session.id": "79ed61d4-63a5-4b3c-a777-1313f1081baf",
+                                "gen_ai.operation.name": "invoke_agent",
+                                "gen_ai.system": "strands-agents",
+                                "gen_ai.agent.name": "Strands Agents",
+                                "gen_ai.request.model": "us.amazon.nova-lite-v1:0",
+                                "gen_ai.usage.input_tokens": 789,
+                                "gen_ai.usage.output_tokens": 43,
+                            },
+                            "events": [
+                                {"name": "gen_ai.user.message", "time_ns": 1792257801921545846,
+                                 "attributes": {"content": '[{"text": "hello"}]'}},
+                                {"name": "gen_ai.choice", "time_ns": 1792257802934541346,
+                                 "attributes": {"message": "Hi there! How can I assist you today?",
+                                                "finish_reason": "end_turn"}},
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "scope_name": "opentelemetry.instrumentation.botocore.bedrock-agentcore",
+                    "spans": [
+                        {
+                            # Bedrock AgentCore infra — must not be forwarded
+                            "name": "Bedrock AgentCore.ListEvents",
+                            "traceId": "6ad3aee9244cc512487ba36768b48bc2",
+                            "spanId": "c9095b7f4e7a41b4",
+                            "parentSpanId": "1116434f34966702",
+                            "startTimeUnixNano": 1792257801534854621,
+                            "endTimeUnixNano": 1792257801644412931,
+                            "attributes": {"rpc.service": "Bedrock AgentCore", "rpc.method": "ListEvents"},
+                            "events": [],
+                        },
+                    ],
+                },
+            ],
+        }
+
+    def test_aws_strands_flat_format_routed(self):
+        """AWS Strands flat-format: invoke_agent * prefix span is forwarded once."""
+        self.forwarder.agent_map["wxo_tracing_test"] = {
+            "wxo_agent_id": "61e315a1-0749-49fc-9972-fd92068fd881",
+        }
+        calls = []
+
+        def fake_post(payload, bearer_token, export_url, agent_id, tenant_id, logger=None):
+            calls.append(payload)
+            return "JOB-AWS"
+
+        payload = self._make_aws_strands_payload()
+        with patch("forwarder.forwarder.get_bearer_token", return_value="mock-token"), \
+             patch("forwarder.forwarder.post_to_wxo", side_effect=fake_post):
+            ids = self.forwarder.process_payload(
+                body_bytes=json.dumps(payload).encode(),
+                content_type="application/json",
+            )
+
+        self.assertEqual(ids, ["JOB-AWS"], "Expected exactly one forwarded trace from invoke_agent span")
+        self.assertEqual(len(calls), 1)
+        fwd_root = calls[0]["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+        self.assertEqual(fwd_root["name"], "invoke_agent wxo_tracing_test")
+
+    def test_aws_bedrock_agentcore_spans_not_forwarded(self):
+        """Bedrock AgentCore.* spans must never be forwarded standalone."""
+        payload = {
+            "resource_attrs": {"service.name": "wxo_tracing_test"},
+            "scope_spans": [{
+                "scope_name": "opentelemetry.instrumentation.botocore.bedrock-agentcore",
+                "spans": [
+                    {"name": "Bedrock AgentCore.CreateEvent", "traceId": "abc", "spanId": "111",
+                     "startTimeUnixNano": 1000, "endTimeUnixNano": 2000, "attributes": {}, "events": []},
+                    {"name": "Bedrock AgentCore.RetrieveMemoryRecords", "traceId": "abc", "spanId": "222",
+                     "startTimeUnixNano": 1000, "endTimeUnixNano": 2000, "attributes": {}, "events": []},
+                ],
+            }],
+        }
+        with patch("forwarder.forwarder.get_bearer_token", return_value="mock-token"), \
+             patch("forwarder.forwarder.post_to_wxo") as mock_post:
+            ids = self.forwarder.process_payload(
+                body_bytes=json.dumps(payload).encode(),
+                content_type="application/json",
+            )
+        self.assertEqual(ids, [])
+        mock_post.assert_not_called()
+
+    def test_aws_execute_event_loop_cycle_not_forwarded(self):
+        """execute_event_loop_cycle must never be forwarded standalone."""
+        payload = {
+            "resource_attrs": {"service.name": "wxo_tracing_test"},
+            "scope_spans": [{
+                "scope_name": "strands.telemetry.tracer",
+                "spans": [
+                    {"name": "execute_event_loop_cycle", "traceId": "abc", "spanId": "333",
+                     "startTimeUnixNano": 1000, "endTimeUnixNano": 2000, "attributes": {}, "events": []},
+                ],
+            }],
+        }
+        with patch("forwarder.forwarder.get_bearer_token", return_value="mock-token"), \
+             patch("forwarder.forwarder.post_to_wxo") as mock_post:
+            ids = self.forwarder.process_payload(
+                body_bytes=json.dumps(payload).encode(),
+                content_type="application/json",
+            )
+        self.assertEqual(ids, [])
+        mock_post.assert_not_called()
+
+    def test_aws_wxo_agent_id_routed_directly(self):
+        """wxo.agent.id in resource_attrs is used as a direct UUID candidate."""
+        wxo_uuid = "61e315a1-0749-49fc-9972-fd92068fd881"
+        payload = {
+            "resource_attrs": {
+                "wxo.agent.id": wxo_uuid,
+                "wxo.environment": "live",
+                "service.name": "my_aws_agent",
+            },
+            "scope_spans": [{
+                "scope_name": "strands.telemetry.tracer",
+                "spans": [{
+                    "name": "invoke_agent MyAgent",
+                    "traceId": "aabbcc", "spanId": "ddee",
+                    "startTimeUnixNano": 1000, "endTimeUnixNano": 2000,
+                    "attributes": {"gen_ai.usage.input_tokens": 10, "gen_ai.usage.output_tokens": 5},
+                    "events": [],
+                }],
+            }],
+        }
+        seen_routing = []
+
+        def fake_resolve(candidate_keys=None, default_name=""):
+            seen_routing.append(candidate_keys)
+            return {"agent_id": wxo_uuid, "agent_name": "my_aws_agent", "tenant_id": "t",
+                    "export_url": "https://api.test/traces", "api_key": "test-api-key",
+                    "token_url": "", "environment": "draft", "matched_key": wxo_uuid,
+                    "display_name": "my_aws_agent"}
+
+        with patch.object(self.forwarder, "resolve_wxo_agent", side_effect=fake_resolve), \
+             patch("forwarder.forwarder.get_bearer_token", return_value="mock-token"), \
+             patch("forwarder.forwarder.post_to_wxo", return_value="JOB-X"):
+            self.forwarder.process_payload(
+                body_bytes=json.dumps(payload).encode(),
+                content_type="application/json",
+            )
+
+        self.assertTrue(len(seen_routing) > 0)
+        keys = seen_routing[0]
+        self.assertIn(wxo_uuid, keys)
+
+    # --------------------------------------------------------------- Claude --
+
+    def test_claude_flat_span_format_forwarded(self):
+        """Claude SDK flat single-span format is parsed and forwarded."""
+        self.forwarder.agent_map["Grader-agent"] = {
+            "wxo_agent_id": "claude-uuid-3333",
+        }
+        claude_span = {
+            "span_name": "anthropic.messages.create",
+            "trace_id": "0x1342d6856e6096bbb60fb1bbce1539d1",
+            "span_id": "0xfa0076c58037fc33",
+            "status": "OK",
+            "start_time_unix_nano": 1792574423142581000,
+            "end_time_unix_nano": 1792574424546128000,
+            "duration_ms": 1403.55,
+            "resource": {
+                "service.name": "Grader-agent",
+                "agent.id": "agent_01GKq3KC6L1BpJfqqoCrnZ8p",
+                "agent.name": "Grader-agent",
+                "gen_ai.agent.id": "agent_01GKq3KC6L1BpJfqqoCrnZ8p",
+                "gen_ai.agent.name": "Grader-agent",
+            },
+            "attributes": {
+                "gen_ai.provider.name": "anthropic",
+                "gen_ai.operation.name": "chat",
+                "gen_ai.request.model": "claude-opus-4-5",
+                "gen_ai.response.model": "claude-opus-4-5-20251101",
+                "gen_ai.usage.input_tokens": 16,
+                "gen_ai.usage.output_tokens": 13,
+                "gen_ai.input.messages": '[{"role":"user","parts":[{"type":"text","content":"What is 2 + 2?"}]}]',
+                "gen_ai.output.messages": '[{"role":"assistant","parts":[{"type":"text","content":"2 + 2 = 4"}]}]',
+                "anthropic.organization.id": "1962860e-5d71-466f-b5c2-bbc3491de9b6",
+                "http.response.status_code": 200,
+            },
+        }
+        calls = []
+
+        def fake_post(payload, bearer_token, export_url, agent_id, tenant_id, logger=None):
+            calls.append(payload)
+            return "JOB-CLAUDE"
+
+        with patch("forwarder.forwarder.get_bearer_token", return_value="mock-token"), \
+             patch("forwarder.forwarder.post_to_wxo", side_effect=fake_post):
+            ids = self.forwarder.process_payload(
+                body_bytes=json.dumps(claude_span).encode(),
+                content_type="application/json",
+            )
+
+        self.assertEqual(ids, ["JOB-CLAUDE"])
+        self.assertEqual(len(calls), 1)
+        fwd_spans = calls[0]["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        root_attrs = {
+            a["key"]: (a["value"].get("intValue") or a["value"].get("stringValue") or 0)
+            for a in fwd_spans[0].get("attributes", [])
+        }
+        self.assertEqual(root_attrs.get("gen_ai.usage.input_tokens"), 16)
+        self.assertEqual(root_attrs.get("gen_ai.usage.output_tokens"), 13)
+
+    # --------------------------------------------------------------- Azure --
+
+    def test_azure_sk_invocation_span_forwarded(self):
+        """Azure Semantic Kernel agent invocation span is forwarded as a WXO trace."""
+        self.forwarder.agent_map["my-sk-agent"] = {"wxo_agent_id": "azure-uuid-5555"}
+        payload = {
+            "resourceSpans": [{
+                "resource": {"attributes": [
+                    {"key": "service.name", "value": {"stringValue": "my-sk-agent"}},
+                    {"key": "gen_ai.system", "value": {"stringValue": "microsoft.semantic_kernel"}},
+                ]},
+                "scopeSpans": [{
+                    "spans": [
+                        {
+                            # invocation root — must forward
+                            "traceId": "aa" * 16,
+                            "spanId": "bb" * 8,
+                            "name": "microsoft.semantic_kernel.agent.invoke",
+                            "startTimeUnixNano": 1000000,
+                            "endTimeUnixNano": 2000000,
+                            "attributes": [
+                                {"key": "gen_ai.system",            "value": {"stringValue": "microsoft.semantic_kernel"}},
+                                {"key": "gen_ai.agent.name",        "value": {"stringValue": "my-sk-agent"}},
+                                {"key": "gen_ai.operation.name",    "value": {"stringValue": "invoke_agent"}},
+                                {"key": "gen_ai.usage.input_tokens","value": {"intValue": 50}},
+                                {"key": "gen_ai.usage.output_tokens","value": {"intValue": 25}},
+                                {"key": "gen_ai.input.messages",    "value": {"stringValue": '[{"role":"user","content":"hello SK"}]'}},
+                                {"key": "gen_ai.output.messages",   "value": {"stringValue": '[{"role":"assistant","content":"Hi from SK!"}]'}},
+                                {"key": "az.ai.agent.thread.id",    "value": {"stringValue": "thread_sk_001"}},
+                            ],
+                        },
+                        {
+                            # subordinate LLM completion — must NOT forward
+                            "traceId": "aa" * 16,
+                            "spanId": "cc" * 8,
+                            "parentSpanId": "bb" * 8,
+                            "name": "openai.chat",
+                            "startTimeUnixNano": 1100000,
+                            "endTimeUnixNano": 1900000,
+                            "attributes": [
+                                {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4o"}},
+                            ],
+                        },
+                    ],
+                }],
+            }]
+        }
+        calls = []
+        with patch("forwarder.forwarder.get_bearer_token", return_value="tok"), \
+             patch("forwarder.forwarder.post_to_wxo", side_effect=lambda payload, **kw: calls.append(payload) or "J"):
+            ids = self.forwarder.process_payload(json.dumps(payload).encode())
+
+        self.assertEqual(len(ids), 1, "Expected exactly one forwarded trace")
+        root_attrs = {a["key"]: (a["value"].get("intValue") or a["value"].get("stringValue") or 0)
+                      for a in calls[0]["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]}
+        self.assertEqual(root_attrs.get("gen_ai.usage.input_tokens"), 50)
+        self.assertEqual(root_attrs.get("gen_ai.usage.output_tokens"), 25)
+        # platform should be resolved from gen_ai.system
+        self.assertEqual(root_attrs.get("llm.system"), "azure_ai_foundry")
+
+    def test_azure_openai_chat_subordinate_not_forwarded(self):
+        """openai.chat sub-spans must never be forwarded as standalone WXO traces."""
+        payload = {
+            "resourceSpans": [{
+                "resource": {"attributes": [
+                    {"key": "service.name", "value": {"stringValue": "my-sk-agent"}},
+                ]},
+                "scopeSpans": [{
+                    "spans": [
+                        {"traceId": "xx", "spanId": "y1", "name": "openai.chat",
+                         "startTimeUnixNano": 1000, "endTimeUnixNano": 2000,
+                         "attributes": [{"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4o"}}]},
+                        {"traceId": "xx", "spanId": "y2", "name": "ChatCompletionsClient.complete",
+                         "startTimeUnixNano": 1000, "endTimeUnixNano": 2000, "attributes": []},
+                        {"traceId": "xx", "spanId": "y3", "name": "az.ai.inference.chat",
+                         "startTimeUnixNano": 1000, "endTimeUnixNano": 2000, "attributes": []},
+                    ],
+                }],
+            }]
+        }
+        with patch("forwarder.forwarder.get_bearer_token", return_value="tok"), \
+             patch("forwarder.forwarder.post_to_wxo") as mock_post:
+            ids = self.forwarder.process_payload(json.dumps(payload).encode())
+        self.assertEqual(ids, [])
+        mock_post.assert_not_called()
+
+    def test_azure_foundry_agent_run_forwarded(self):
+        """Azure AI Foundry Assistants SDK agent_run span is forwarded."""
+        self.forwarder.agent_map["foundry-agent"] = {"wxo_agent_id": "foundry-uuid-6666"}
+        payload = {
+            "resourceSpans": [{
+                "resource": {"attributes": [
+                    {"key": "service.name", "value": {"stringValue": "foundry-agent"}},
+                ]},
+                "scopeSpans": [{
+                    "spans": [{
+                        "traceId": "abcdef" * 5 + "ab",
+                        "spanId": "1234567812345678",
+                        "name": "agent_run",
+                        "startTimeUnixNano": 1000000,
+                        "endTimeUnixNano": 3000000,
+                        "attributes": [
+                            {"key": "gen_ai.system",              "value": {"stringValue": "az.ai.inference"}},
+                            {"key": "gen_ai.agent.name",          "value": {"stringValue": "foundry-agent"}},
+                            {"key": "az.ai.agent.thread.id",      "value": {"stringValue": "thread_foundry_abc"}},
+                            {"key": "gen_ai.usage.input_tokens",  "value": {"intValue": 100}},
+                            {"key": "gen_ai.usage.output_tokens", "value": {"intValue": 40}},
+                        ],
+                    }],
+                }],
+            }]
+        }
+        captured = []
+        with patch("forwarder.forwarder.get_bearer_token", return_value="tok"), \
+             patch("forwarder.forwarder.post_to_wxo",
+                   side_effect=lambda payload, **kw: captured.append(payload) or "J"):
+            ids = self.forwarder.process_payload(json.dumps(payload).encode())
+        self.assertEqual(len(ids), 1)
+        root_attrs = {a["key"]: (a["value"].get("intValue") or a["value"].get("stringValue") or 0)
+                      for a in captured[0]["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]}
+        self.assertEqual(root_attrs.get("gen_ai.usage.input_tokens"), 100)
+        # session_id must come from az.ai.agent.thread.id
+        self.assertEqual(root_attrs.get("thread.id"), "thread_foundry_abc")
+        # platform resolved from gen_ai.system=az.ai.inference
+        self.assertEqual(root_attrs.get("llm.system"), "azure_ai_foundry")
+
+    # -------------------------------------------------------------- Vertex --
+
+    def test_vertex_generate_content_prefix_forwarded(self):
+        """Vertex Gemini direct SDK: 'generate_content <model>' prefix is forwarded."""
+        self.forwarder.agent_map["gemini-agent"] = {"wxo_agent_id": "vertex-uuid-7777"}
+        payload = {
+            "resourceSpans": [{
+                "resource": {"attributes": [
+                    {"key": "service.name",  "value": {"stringValue": "gemini-agent"}},
+                    {"key": "gen_ai.system", "value": {"stringValue": "vertexai"}},
+                ]},
+                "scopeSpans": [{
+                    "spans": [{
+                        "traceId": "vertex001" * 4,
+                        "spanId":  "vv001122",
+                        "name":    "generate_content gemini-2.0-flash",
+                        "startTimeUnixNano": 1000000,
+                        "endTimeUnixNano":   4000000,
+                        "attributes": [
+                            {"key": "gen_ai.system",              "value": {"stringValue": "vertexai"}},
+                            {"key": "gen_ai.request.model",       "value": {"stringValue": "gemini-2.0-flash"}},
+                            {"key": "gen_ai.usage.input_tokens",  "value": {"intValue": 200}},
+                            {"key": "gen_ai.usage.output_tokens", "value": {"intValue": 80}},
+                            {"key": "gen_ai.input.messages",      "value": {"stringValue": '[{"role":"user","content":"what is 1+1?"}]'}},
+                            {"key": "gen_ai.output.messages",     "value": {"stringValue": '[{"role":"assistant","content":"2"}]'}},
+                        ],
+                    }],
+                }],
+            }]
+        }
+        captured = []
+        with patch("forwarder.forwarder.get_bearer_token", return_value="tok"), \
+             patch("forwarder.forwarder.post_to_wxo",
+                   side_effect=lambda payload, **kw: captured.append(payload) or "J"):
+            ids = self.forwarder.process_payload(json.dumps(payload).encode())
+
+        self.assertEqual(len(ids), 1)
+        root_attrs = {a["key"]: (a["value"].get("intValue") or a["value"].get("stringValue") or 0)
+                      for a in captured[0]["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]}
+        self.assertEqual(root_attrs.get("gen_ai.usage.input_tokens"), 200)
+        self.assertEqual(root_attrs.get("gen_ai.usage.output_tokens"), 80)
+        self.assertEqual(root_attrs.get("llm.system"), "vertex_ai")
+
+    def test_vertex_grpc_infra_spans_not_forwarded(self):
+        """google.cloud.* and PredictionServiceClient.* spans must not be forwarded."""
+        payload = {
+            "resourceSpans": [{
+                "resource": {"attributes": [
+                    {"key": "service.name", "value": {"stringValue": "gemini-agent"}},
+                ]},
+                "scopeSpans": [{
+                    "spans": [
+                        {"traceId": "x", "spanId": "a1", "name": "PredictionServiceClient.generate_content",
+                         "startTimeUnixNano": 1000, "endTimeUnixNano": 2000, "attributes": []},
+                        {"traceId": "x", "spanId": "a2", "name": "google.cloud.aiplatform.prediction",
+                         "startTimeUnixNano": 1000, "endTimeUnixNano": 2000, "attributes": []},
+                        {"traceId": "x", "spanId": "a3", "name": "google.cloud.something.else",
+                         "startTimeUnixNano": 1000, "endTimeUnixNano": 2000, "attributes": []},
+                    ],
+                }],
+            }]
+        }
+        with patch("forwarder.forwarder.get_bearer_token", return_value="tok"), \
+             patch("forwarder.forwarder.post_to_wxo") as mock_post:
+            ids = self.forwarder.process_payload(json.dumps(payload).encode())
+        self.assertEqual(ids, [])
+        mock_post.assert_not_called()
+
+    def test_platform_resolution_from_gen_ai_system(self):
+        """_resolve_platform correctly maps gen_ai.system values to platform tags."""
+        from forwarder.forwarder import _resolve_platform
+        cases = [
+            ({"gen_ai.system": "az.ai.inference"},           {}, "azure_ai_foundry"),
+            ({"gen_ai.system": "microsoft.semantic_kernel"},  {}, "azure_ai_foundry"),
+            ({"gen_ai.system": "aws.bedrock"},                {}, "aws_agentcore"),
+            ({"gen_ai.system": "strands-agents"},             {}, "aws_agentcore"),
+            ({"gen_ai.system": "anthropic"},                  {}, "claude-platform"),
+            ({"gen_ai.system": "vertexai"},                   {}, "vertex_ai"),
+            ({"gen_ai.system": "openai"},                     {}, "openai"),
+            ({},  {"service.name": "my-custom-agent"},            "my-custom-agent"),
+            ({},  {},                                              "external_agent"),
+        ]
+        for attrs, res_attrs, expected in cases:
+            with self.subTest(attrs=attrs):
+                self.assertEqual(_resolve_platform(attrs, res_attrs), expected)
+
+    def test_claude_flat_span_prompt_and_response_extracted(self):
+        """gen_ai.input/output.messages in Claude flat span are unwrapped to plain text."""
+        self.forwarder.agent_map["Grader-agent"] = {"wxo_agent_id": "claude-uuid-3333"}
+        claude_span = {
+            "span_name": "anthropic.messages.create",
+            "trace_id": "deadbeef",
+            "span_id": "cafebabe",
+            "start_time_unix_nano": 1000000,
+            "end_time_unix_nano": 2000000,
+            "resource": {"service.name": "Grader-agent"},
+            "attributes": {
+                "gen_ai.request.model": "claude-opus-4-5",
+                "gen_ai.usage.input_tokens": 5,
+                "gen_ai.usage.output_tokens": 3,
+                "gen_ai.input.messages": '[{"role":"user","parts":[{"type":"text","content":"hello claude"}]}]',
+                "gen_ai.output.messages": '[{"role":"assistant","parts":[{"type":"text","content":"Hello!"}]}]',
+            },
+        }
+        captured = []
+        with patch("forwarder.forwarder.get_bearer_token", return_value="tok"), \
+             patch("forwarder.forwarder.post_to_wxo",
+                   side_effect=lambda payload, **kw: captured.append(payload) or "J"):
+            self.forwarder.process_payload(json.dumps(claude_span).encode())
+
+        self.assertEqual(len(captured), 1)
+        root = captured[0]["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+        attr_map = {a["key"]: a["value"].get("stringValue", "") for a in root["attributes"]}
+        self.assertEqual(attr_map.get("gen_ai.task.input"), "hello claude")
+        self.assertEqual(attr_map.get("gen_ai.task.output"), "Hello!")
+
+
+    # ---------------------------------------------------------- Scores / Eval --
+
+    def test_extract_scores_numeric(self):
+        """eval.* and score.* attributes with numeric-like string values become
+        NUMERIC scores."""
+        attrs = {
+            "eval.relevance":     "0.92",
+            "eval.toxicity":      "0.00",
+            "score.faithfulness": "0.87",
+            "llm.eval.groundedness": 0.75,
+        }
+        scores = OtlpForwarder._extract_scores(attrs)
+        self.assertEqual(len(scores), 4)
+        by_name = {s["name"]: s for s in scores}
+        self.assertEqual(by_name["relevance"]["dataType"], "NUMERIC")
+        self.assertAlmostEqual(by_name["relevance"]["value"], 0.92)
+        self.assertEqual(by_name["toxicity"]["dataType"], "NUMERIC")
+        self.assertAlmostEqual(by_name["toxicity"]["value"], 0.0)
+        self.assertAlmostEqual(by_name["faithfulness"]["value"], 0.87)
+        self.assertAlmostEqual(by_name["groundedness"]["value"], 0.75)
+
+    def test_extract_scores_categorical(self):
+        """eval.* attributes with non-numeric string values become CATEGORICAL
+        scores, preserving the string in stringValue."""
+        attrs = {
+            "eval.sentiment": "positive",
+            "langfuse.score.quality": "high",
+        }
+        scores = OtlpForwarder._extract_scores(attrs)
+        by_name = {s["name"]: s for s in scores}
+        self.assertEqual(by_name["sentiment"]["dataType"], "CATEGORICAL")
+        self.assertEqual(by_name["sentiment"]["stringValue"], "positive")
+        self.assertEqual(by_name["sentiment"]["value"], 0.0)
+        self.assertEqual(by_name["quality"]["dataType"], "CATEGORICAL")
+
+    def test_extract_scores_ignores_non_score_attrs(self):
+        """Attributes not matching a score prefix must be ignored."""
+        attrs = {
+            "gen_ai.request.model": "claude-opus-5-5",
+            "gen_ai.usage.input_tokens": 100,
+            "session.id": "abc",
+        }
+        scores = OtlpForwarder._extract_scores(attrs)
+        self.assertEqual(scores, [])
+
+    def test_extract_scores_dedup(self):
+        """The same score name under two different prefixes only appears once."""
+        attrs = {
+            "eval.relevance":         "0.9",
+            "eval.score.relevance":   "0.8",  # second hit — must be skipped
+        }
+        scores = OtlpForwarder._extract_scores(attrs)
+        names = [s["name"] for s in scores]
+        self.assertEqual(names.count("relevance"), 1)
+
+    def test_process_payload_posts_scores_after_trace(self):
+        """When a span carries eval.* attributes, post_scores_to_wxo must be
+        called once after post_to_wxo succeeds, with the correct trace_id and
+        score names."""
+        score_calls = []
+
+        def fake_post_scores(scores, trace_id, bearer_token, export_url,
+                             agent_id, tenant_id, logger=None):
+            score_calls.append({"scores": scores, "trace_id": trace_id})
+            return True
+
+        sample_otlp = {
+            "resourceSpans": [{
+                "resource": {"attributes": [
+                    {"key": "service.name", "value": {"stringValue": "default"}},
+                ]},
+                "scopeSpans": [{
+                    "spans": [{
+                        "traceId": "abc123",
+                        "spanId": "span001",
+                        "name": "invoke_agent",
+                        "startTimeUnixNano": 1_000_000_000,
+                        "endTimeUnixNano":   2_000_000_000,
+                        "attributes": [
+                            {"key": "gen_ai.prompt",      "value": {"stringValue": "hi"}},
+                            {"key": "gen_ai.completion",  "value": {"stringValue": "hello"}},
+                            {"key": "eval.relevance",     "value": {"stringValue": "0.95"}},
+                            {"key": "eval.toxicity",      "value": {"stringValue": "0.01"}},
+                        ],
+                        "events": [],
+                    }]
+                }]
+            }]
+        }
+
+        with patch("forwarder.forwarder.get_bearer_token", return_value="tok"), \
+             patch("forwarder.forwarder.post_to_wxo", return_value="TRACE-ABC"), \
+             patch("forwarder.forwarder.post_scores_to_wxo", side_effect=fake_post_scores):
+            ids = self.forwarder.process_payload(
+                body_bytes=json.dumps(sample_otlp).encode(),
+                content_type="application/json",
+            )
+
+        self.assertEqual(ids, ["TRACE-ABC"])
+        self.assertEqual(len(score_calls), 1)
+        self.assertEqual(score_calls[0]["trace_id"], "TRACE-ABC")
+        score_names = {s["name"] for s in score_calls[0]["scores"]}
+        self.assertIn("relevance", score_names)
+        self.assertIn("toxicity", score_names)
+
+    def test_process_payload_no_scores_when_no_eval_attrs(self):
+        """When a span has no eval.* attributes, post_scores_to_wxo must not be
+        called at all."""
+        sample_otlp = {
+            "resourceSpans": [{
+                "resource": {"attributes": [
+                    {"key": "service.name", "value": {"stringValue": "default"}},
+                ]},
+                "scopeSpans": [{
+                    "spans": [{
+                        "traceId": "xyz",
+                        "spanId": "s1",
+                        "name": "invoke_agent",
+                        "startTimeUnixNano": 1_000_000_000,
+                        "endTimeUnixNano":   2_000_000_000,
+                        "attributes": [
+                            {"key": "gen_ai.prompt",     "value": {"stringValue": "q"}},
+                            {"key": "gen_ai.completion", "value": {"stringValue": "a"}},
+                        ],
+                        "events": [],
+                    }]
+                }]
+            }]
+        }
+        with patch("forwarder.forwarder.get_bearer_token", return_value="tok"), \
+             patch("forwarder.forwarder.post_to_wxo", return_value="JX"), \
+             patch("forwarder.forwarder.post_scores_to_wxo") as mock_scores:
+            self.forwarder.process_payload(
+                body_bytes=json.dumps(sample_otlp).encode(),
+                content_type="application/json",
+            )
+        mock_scores.assert_not_called()
+
+    def test_post_scores_to_wxo_derives_scores_url(self):
+        """post_scores_to_wxo replaces inject/traces with inject/scores in the URL."""
+        captured_urls = []
+
+        class FakeResp:
+            status = 200
+            def read(self): return b"{}"
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+
+        def fake_urlopen(req, timeout=None, context=None):
+            captured_urls.append(req.full_url)
+            return FakeResp()
+
+        scores = [{"name": "relevance", "value": 0.9, "dataType": "NUMERIC"}]
+        with patch("forwarder.forwarder.urlopen", side_effect=fake_urlopen):
+            result = post_scores_to_wxo(
+                scores=scores,
+                trace_id="trace-001",
+                bearer_token="tok",
+                export_url="https://api.test/inject/traces",
+                agent_id="agent-a",
+                tenant_id="tenant-t",
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(len(captured_urls), 1)
+        self.assertIn("inject/scores", captured_urls[0])
+        self.assertNotIn("inject/traces", captured_urls[0])
 
 
 if __name__ == "__main__":
