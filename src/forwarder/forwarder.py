@@ -194,6 +194,47 @@ def _bv(k: str, v: bool) -> dict:
     return {"key": k, "value": {"boolValue": bool(v)}}
 
 
+# Map gen_ai.system values (and other signals) to a human-readable platform tag
+# that becomes llm.system / framework in the forwarded WXO span.
+_GEN_AI_SYSTEM_TO_PLATFORM: dict[str, str] = {
+    # Azure
+    "az.ai.inference":          "azure_ai_foundry",
+    "azure_ai_foundry":         "azure_ai_foundry",
+    "azure_openai":             "azure_ai_foundry",
+    "openai":                   "openai",
+    "microsoft.semantic_kernel":"azure_ai_foundry",
+    # AWS
+    "aws.bedrock":              "aws_agentcore",
+    "aws_agentcore":            "aws_agentcore",
+    "strands-agents":           "aws_agentcore",
+    # Anthropic
+    "anthropic":                "claude-platform",
+    "claude-platform":          "claude-platform",
+    # Vertex / Google
+    "vertexai":                 "vertex_ai",
+    "vertex_ai":                "vertex_ai",
+    "google_vertex":            "vertex_ai",
+    "google-cloud-aiplatform":  "vertex_ai",
+    # Gemini (ADK direct)
+    "gemini":                   "vertex_ai",
+}
+
+
+def _resolve_platform(attrs: dict, res_attrs: dict) -> str:
+    """Derive a semantic platform tag from span + resource attributes."""
+    gen_ai_sys = (
+        attrs.get("gen_ai.system")
+        or attrs.get("llm.system")
+        or attrs.get("framework")
+        or res_attrs.get("gen_ai.system")
+        or ""
+    ).lower().strip()
+    if gen_ai_sys in _GEN_AI_SYSTEM_TO_PLATFORM:
+        return _GEN_AI_SYSTEM_TO_PLATFORM[gen_ai_sys]
+    # Fallback: service.name gives a human-readable tag
+    return res_attrs.get("service.name") or "external_agent"
+
+
 def build_otlp_payload(
     *,
     agent_id: str,
@@ -216,6 +257,9 @@ def build_otlp_payload(
     user_id: str = "",
     tool_calls: list | None = None,
     extra_attributes: list | None = None,
+    workspace_id: str = "",
+    instance_id: str = "",
+    reasoning_steps: list[str] | None = None,
 ) -> dict:
     """
     Build a WXO-compliant OTLP payload with the 4-level span tree WXO expects:
@@ -224,6 +268,12 @@ def build_otlp_payload(
           └── call_llm                     (LLM wrapper — carries token counts)
                 └── generate_content <model>  (LLM leaf — actual model call)
                       └── <tool_name>         (TOOL, one per tool call; optional)
+
+    ``reasoning_steps`` is an optional list of reasoning/thinking text strings
+    extracted from the upstream span (e.g. Anthropic extended-thinking, model
+    chain-of-thought).  Each entry becomes a ``gen_ai.reasoning`` event on the
+    root span so WXO can populate the Langfuse ``steps`` array, matching the
+    structure emitted by the internal wxo-server LangGraph pipeline.
     """
     now_ns = int(time.time() * 1e9)
     _start_ns = start_ns or now_ns
@@ -237,23 +287,75 @@ def build_otlp_payload(
         output_tokens = count_tokens(response)
     total_tokens = input_tokens + output_tokens
 
-    _trace_id  = trace_id or uuid.uuid4().hex
-    _span_id   = span_id or secrets.token_hex(8)
+    _trace_id   = trace_id or uuid.uuid4().hex
+    _span_id    = span_id or secrets.token_hex(8)
     _session_id = session_id or str(uuid.uuid4())
     _message_id = str(uuid.uuid4())
     _user_id    = user_id or f"usr_{uuid.uuid4().hex[:12]}"
     _span_name  = f"invoke_agent {agent_name}"
     _model_name = model_name or agent_name
     _latency_ms = max(1, (_end_ns - _start_ns) // 1_000_000)
+    _workspace_id = workspace_id or "00000000-0000-0000-0000-000000000001"
+    _instance_id  = instance_id or tenant_id  # fall back to tenant_id when not provided
 
     input_messages  = json.dumps([{"role": "user",      "content": prompt}])
     output_messages = json.dumps([{"role": "assistant", "content": response}])
+
+    # WXO message envelope — mirrors the structured input object that WXO's own
+    # LangGraph pipeline (wxo-server) emits on the root Langfuse trace.  External
+    # agents must carry this as a span attribute so the trace's `input` field in
+    # Langfuse is a rich object rather than a bare string.
+    _input_envelope = json.dumps({
+        "role": "user",
+        "content": prompt,
+        "mentions": None,
+        "document_ids": None,
+        "parent_message_id": None,
+        "additional_properties": {
+            "wxa_message": None,
+            "display_properties": None,
+            "tool_calls": None,
+            "tool_call_id": None,
+            "tool_name": None,
+            "wxo_connection_status": None,
+            "log_id": None,
+            "captured_logs": None,
+            "is_interrupt": False,
+            "tool_flow_properties": None,
+            "architect_conversational_state": None,
+            "current_workflow": None,
+            "metadata": None,
+            "agent_id": None,
+            "a2a_task_completed": False,
+            "error_code": None,
+        },
+        "assistant_id": None,
+        "context": None,
+        "step_history": None,
+        "message_state": None,
+        "log_id": None,
+        "meta": None,
+        "user_defined": None,
+        "session_id": _session_id,
+        "trace_id": None,
+    })
+
+    # WXO facet tags — mirrors what WXO's own LangGraph instrumentation emits so
+    # the Langfuse UI shows rich metadata (tags, workspace facets, etc.) for all
+    # external-agent platforms (AWS, Claude, Azure, Vertex).
+    _langfuse_tags = json.dumps([
+        f"agent_id:{agent_id}",
+        f"environment:{environment}",
+        f"tenant_id:{tenant_id}",
+        f"workspace_id:{_workspace_id}",
+    ])
 
     # ── Root span: invoke_agent (AGENT) ──────────────────────────────────────
     root_attrs = [
         _sv("agent.id",              agent_id),
         _sv("agent.name",            agent_name),
         _sv("agent.display_name",    agent_name),
+        _sv("agent.version",         "1"),
         _sv("gen_ai.operation.name", "invoke_agent"),
         _sv("gen_ai.agent.id",       agent_id),
         _sv("gen_ai.agent.name",     agent_name),
@@ -264,14 +366,33 @@ def build_otlp_payload(
         _sv("langfuse.user.id",      _user_id),
         _sv("message.id",            _message_id),
         _sv("environment.name",      environment),
+        _sv("environment.id",        environment),
+        _sv("workspace.id",          _workspace_id),
+        _sv("instance.id",           _instance_id),
+        _sv("tenant.id",             tenant_id),
+        # WXO facet attributes — used by Langfuse for tag generation and routing
+        _sv("wxo.facet.tenant_id",    tenant_id),
+        _sv("wxo.facet.workspace_id", _workspace_id),
+        _sv("wxo.facet.agent_id",     agent_id),
+        _sv("wxo.facet.workflow_id",  _span_name),
+        _sv("wxo.channel.name",       "external_agent"),
+        _sv("wxo.channel.type",       "text"),
+        # Langfuse trace-level markers
+        _sv("langfuse.internal.as_root", "true"),
+        _sv("langfuse.trace.name",    _span_name),
+        _sv("langfuse.tags",          _langfuse_tags),
+        _sv("is.root",                "true"),
+        _sv("global_transaction_id",  _trace_id),
         _sv("gen_ai.input.messages",  input_messages),
         _sv("gen_ai.output.messages", output_messages),
+        # Structured WXO message envelope — WXO reads this to set a rich input
+        # object on the Langfuse trace (matching the wxo-server LangGraph shape)
+        # instead of a bare string.
+        _sv("gen_ai.message.input",   _input_envelope),
         _sv("input.value",   prompt),
         _sv("output.value",  response),
         _sv("gen_ai.task.input",  prompt),
         _sv("gen_ai.task.output", response),
-        _sv("langfuse.trace.name", _span_name),
-        _sv("is.root",  "true"),
         _sv("input",    prompt),
         _sv("output",   response),
         _sv("llm.model_name",       _model_name),
@@ -302,6 +423,23 @@ def build_otlp_payload(
     if extra_attributes:
         root_attrs.extend(extra_attributes)
 
+    # Reasoning step events — each entry becomes a ``steps`` row in the Langfuse
+    # trace, matching the shape emitted by WXO's internal LangGraph pipeline:
+    #   { observationId, traceId: null, name, startTime: null, type, content }
+    # We encode them as OTel span events so they survive the OTLP wire format.
+    _step_events: list[dict] = []
+    for _step_text in (reasoning_steps or []):
+        if _step_text:
+            _step_events.append({
+                "name": "gen_ai.reasoning",
+                "timeUnixNano": _start_ns,
+                "attributes": [
+                    _sv("gen_ai.reasoning.content", str(_step_text)[:4000]),
+                    _sv("langfuse.step.type",        "reasoning"),
+                    _sv("langfuse.step.name",        f"generate_content {_model_name}"),
+                ],
+            })
+
     root_span = {
         "traceId":           _trace_id,
         "spanId":            _span_id,
@@ -311,6 +449,7 @@ def build_otlp_payload(
         "endTimeUnixNano":   _end_ns,
         "status":            {"code": 2 if is_error else 0},
         "attributes":        root_attrs,
+        **({"events": _step_events} if _step_events else {}),
     }
 
     # ── call_llm span (LLM wrapper, child of root) ────────────────────────────
@@ -409,7 +548,7 @@ def build_otlp_payload(
                 _sv("tool.parameters",          str(tc.get("input",  ""))[:2000]),
                 _sv("tool.output",              str(tc.get("output", ""))[:2000]),
                 _sv("input.value",              str(tc.get("input",  ""))[:2000]),
-                _sv("output.value",             str(tc.get("output", ""))[:2000]),
+                # NB: no output.value on TOOL spans — WXO drops the span.
             ]
             spans.append({
                 "traceId":           _trace_id,
@@ -450,18 +589,22 @@ def build_otlp_payload(
     return {
         "resourceSpans": [{
             "resource": {"attributes": [
-                _sv("service.name",           agent_name),
-                _sv("service.version",        "1.0.0"),
-                _sv("tenant.id",              tenant_id),
-                _sv("agent.id",               agent_id),
-                _sv("agent.name",             agent_name),
-                _sv("agent.display_name",     agent_name),
-                _sv("gen_ai.agent.id",        agent_id),
-                _sv("gen_ai.agent.name",      agent_name),
-                _sv("environment.name",       environment),
-                _sv("deployment.environment", environment),
+                _sv("service.name",              agent_name),
+                _sv("service.version",           "1.0.0"),
+                _sv("telemetry.sdk.language",    "python"),
+                _sv("telemetry.sdk.name",        "opentelemetry"),
+                _sv("telemetry.sdk.version",     "1.0.0"),
+                _sv("application",               agent_name),
+                _sv("tenant.id",                 tenant_id),
+                _sv("agent.id",                  agent_id),
+                _sv("agent.name",                agent_name),
+                _sv("agent.display_name",        agent_name),
+                _sv("gen_ai.agent.id",           agent_id),
+                _sv("gen_ai.agent.name",         agent_name),
+                _sv("environment.name",          environment),
+                _sv("deployment.environment",    environment),
             ]},
-            "scopeSpans": [{"scope": {"name": "wxo-otlp-forwarder", "version": "2.0.0"}, "spans": spans}],
+            "scopeSpans": [{"scope": {"name": "wxo-universal-forwarder", "version": "2.0.0"}, "spans": spans}],
         }]
     }
 
@@ -518,6 +661,84 @@ def post_to_wxo(
     if logger:
         logger.error(f"Failed to post trace to WXO after {retries} attempts: {last_exc}")
     return ""
+
+
+def post_scores_to_wxo(
+    scores: list[dict],
+    trace_id: str,
+    bearer_token: str,
+    export_url: str,
+    agent_id: str,
+    tenant_id: str,
+    logger=None,
+) -> bool:
+    """
+    POST Langfuse-compatible score objects to the WXO scores endpoint.
+
+    WXO exposes a scores ingest URL derived from the traces URL by replacing
+    the ``inject/traces`` suffix with ``inject/scores``.  Each score object
+    must match the Langfuse score shape::
+
+        {
+          "traceId":    "<trace-id>",
+          "name":       "<score-name>",      # e.g. "relevance", "toxicity"
+          "value":      <float>,             # numeric score
+          "dataType":   "NUMERIC",           # or "CATEGORICAL" / "BOOLEAN"
+          "source":     "API",
+          "comment":    "<optional text>",
+          "metadata":   { "agent_id": "..." }
+        }
+
+    Returns True if the POST succeeded.
+    """
+    if not scores or not trace_id or not bearer_token or not export_url:
+        return False
+
+    # Derive scores URL: .../inject/traces -> .../inject/scores
+    if "inject/traces" in export_url:
+        scores_url = export_url.replace("inject/traces", "inject/scores")
+    elif export_url.rstrip("/").endswith("/traces"):
+        scores_url = export_url.rstrip("/")[:-len("traces")] + "scores"
+    else:
+        scores_url = export_url.rstrip("/") + "/scores"
+
+    # Stamp every score with the trace ID and agent metadata
+    stamped = []
+    for s in scores:
+        entry = dict(s)
+        entry["traceId"] = trace_id
+        entry.setdefault("source", "API")
+        entry.setdefault("metadata", {})
+        if agent_id:
+            entry["metadata"]["agent_id"] = agent_id
+        stamped.append(entry)
+
+    payload = json.dumps({"scores": stamped}).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {bearer_token}",
+        "Content-Type": "application/json",
+        "User-Agent": "curl/7.68.0",
+        "x-ibm-agent-id": agent_id,
+        "x-langfuse-ingestion-version": "4",
+    }
+    if deployment_mode() == "cloud":
+        headers["x-ibm-tenant-id"] = tenant_id
+        headers["x-tenant-id"] = tenant_id
+
+    try:
+        req = Request(scores_url, data=payload, headers=headers, method="POST")
+        ctx = _ssl_context()
+        with urlopen(req, timeout=15, context=ctx) as resp:
+            if logger:
+                logger.info(
+                    f"Scores posted to WXO: status={resp.status} "
+                    f"trace_id={trace_id} count={len(stamped)}"
+                )
+            return True
+    except Exception as exc:
+        if logger:
+            logger.warning(f"Failed to post scores for trace {trace_id}: {exc}")
+        return False
 
 
 # =============================================================================
@@ -1326,7 +1547,26 @@ class OtlpForwarder:
             try:
                 data = json.loads(body_bytes.decode("utf-8", errors="replace"))
                 if isinstance(data, dict):
-                    resource_spans = data.get("resourceSpans", [])
+                    # Standard OTLP JSON: { "resourceSpans": [...] }
+                    if "resourceSpans" in data:
+                        resource_spans = data["resourceSpans"]
+                    # AWS AgentCore Flow B direct observability callback:
+                    #   Variant A: { "agentRuntimeArn": "...", "input": "...", "output": "...",
+                    #                "usage": {...}, "startTime": "...", "endTime": "..." }
+                    #   Variant B: { "invocationInput": {...}, "invocationOutput": {...},
+                    #                "sessionId": "...", "requestId": "..." }
+                    # Normalise into a synthetic resource_span so the rest of the
+                    # pipeline can process it identically to any other platform.
+                    elif "agentRuntimeArn" in data or "invocationInput" in data:
+                        resource_spans = [{"_agentcore_callback": True, "_event": data}]
+                    # AWS Strands/AgentCore flat format:
+                    #   { "resource_attrs": {...}, "scope_spans": [...] }
+                    elif "resource_attrs" in data or "scope_spans" in data:
+                        resource_spans = [data]
+                    # Claude flat single-span format:
+                    #   { "span_name": "...", "resource": {...}, "attributes": {...}, ... }
+                    elif "span_name" in data or ("attributes" in data and "resource" in data and "resourceSpans" not in data):
+                        resource_spans = [{"_claude_flat": True, "resource": data.get("resource", {}), "_span": data}]
             except Exception:
                 # Try fallback protobuf decode
                 is_proto = True
@@ -1356,20 +1596,140 @@ class OtlpForwarder:
         job_ids = []
 
         for rs in resource_spans:
-            # Flatten resource attributes
+            # ── AWS AgentCore Flow B direct observability callback ────────────
+            # Normalise the flat event into the same routing/building path as
+            # any OTLP span so a single code path ships it to WXO.
+            if rs.get("_agentcore_callback"):
+                ev = rs["_event"]
+                # Variant A: {agentRuntimeArn, input, output, usage, startTime, endTime}
+                if "agentRuntimeArn" in ev:
+                    arn = str(ev.get("agentRuntimeArn", ""))
+                    runtime_id = arn.rstrip("/").rsplit("/", 1)[-1] if arn else ""
+                    raw_prompt   = str(ev.get("input",  "") or "")
+                    raw_response = str(ev.get("output", "") or "")
+                    usage = ev.get("usage") or {}
+                    it = int(usage.get("inputTokens",  usage.get("input_tokens",  0)) or 0)
+                    ot = int(usage.get("outputTokens", usage.get("output_tokens", 0)) or 0)
+                    _st = ev.get("startTime", "")
+                    _et = ev.get("endTime",   "")
+                    def _iso_to_ns(s):
+                        try:
+                            from datetime import datetime, timezone
+                            dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+                            return int(dt.timestamp() * 1e9)
+                        except Exception:
+                            return 0
+                    start_ns = _iso_to_ns(_st) or int(time.time() * 1e9) - 1_000_000_000
+                    end_ns   = _iso_to_ns(_et) or int(time.time() * 1e9)
+                    session_id = str(ev.get("sessionId") or ev.get("contextId") or "")
+                # Variant B: {invocationInput, invocationOutput, sessionId, requestId}
+                else:
+                    inv_in   = ev.get("invocationInput",  {}) or {}
+                    inv_out  = ev.get("invocationOutput", {}) or {}
+                    raw_prompt   = str(inv_in.get("text")  or inv_in.get("input",  "") or json.dumps(inv_in)[:300])
+                    raw_response = str(inv_out.get("text") or inv_out.get("output", "") or json.dumps(inv_out)[:300])
+                    it, ot = 0, 0
+                    start_ns = int(time.time() * 1e9) - 1_000_000_000
+                    end_ns   = int(time.time() * 1e9)
+                    session_id = str(ev.get("sessionId", ""))
+                    runtime_id = ""
+
+                # Resolve agent via runtime_id → agent map key
+                candidate_keys = [
+                    explicit_agent_id, runtime_id,
+                    ev.get("agentId"), ev.get("agent_id"),
+                ]
+                routing = self.resolve_wxo_agent(
+                    candidate_keys=[k for k in candidate_keys if k],
+                    default_name=runtime_id or "aws_agentcore_agent",
+                )
+                agent_id   = routing["agent_id"]
+                tenant_id  = routing["tenant_id"]
+                export_url = routing["export_url"]
+                api_key    = routing["api_key"]
+                token_url  = routing["token_url"]
+                env_name   = routing["environment"]
+                clean_name = routing["agent_name"]
+
+                if not agent_id or not export_url or not auth_configured(api_key):
+                    log.warning(f"Skipping AgentCore callback: no WXO agent mapped "
+                                f"(agent_id={agent_id!r}, export_url={bool(export_url)}, "
+                                f"candidate_keys={candidate_keys})")
+                    continue
+
+                # Extract any eval scores carried on the AgentCore event
+                _ac_scores = self._extract_scores({
+                    k: v for k, v in ev.items()
+                    if str(k).lower().startswith(("eval.", "score.", "langfuse.score.", "llm.eval."))
+                })
+
+                wxo_payload = build_otlp_payload(
+                    agent_id=agent_id, agent_name=clean_name, tenant_id=tenant_id,
+                    environment=env_name, prompt=raw_prompt, response=raw_response,
+                    start_ns=start_ns, end_ns=end_ns,
+                    input_tokens=it, output_tokens=ot,
+                    platform="aws_bedrock_agentcore",
+                    session_id=session_id,
+                    trace_id=str(ev.get("requestId", "") or ""),
+                    user_id=str(ev.get("userId", "") or ""),
+                    reasoning_steps=[str(ev["reasoning"])] if ev.get("reasoning") else None,
+                )
+                token = get_bearer_token(api_key, token_url, logger=log)
+                if token:
+                    job_id = post_to_wxo(
+                        payload=wxo_payload, bearer_token=token,
+                        export_url=export_url, agent_id=agent_id,
+                        tenant_id=tenant_id, logger=log,
+                    )
+                    if job_id:
+                        job_ids.append(job_id)
+                        if _ac_scores:
+                            post_scores_to_wxo(
+                                scores=_ac_scores,
+                                trace_id=job_id,
+                                bearer_token=token,
+                                export_url=export_url,
+                                agent_id=agent_id,
+                                tenant_id=tenant_id,
+                                logger=log,
+                            )
+                else:
+                    log.error(f"Failed to obtain bearer token for AgentCore callback agent {agent_id}")
+                continue  # done with this rs entry
+
+            # Flatten resource attributes — handle three formats:
+            # 1. Standard OTLP JSON:  resource.attributes = [{key, value}]
+            # 2. AWS flat format:     resource_attrs = {k: v, ...}
+            # 3. Claude flat format:  resource = {k: v, ...}  (no "attributes" sub-key)
             res_attrs = {}
-            for k, v in (rs.get("resource", {}).get("attributes", {}) or {}).items() if isinstance(rs.get("resource", {}).get("attributes"), dict) else []:
-                res_attrs[k] = v
+
+            # AWS flat resource_attrs dict
+            if isinstance(rs.get("resource_attrs"), dict):
+                res_attrs.update(rs["resource_attrs"])
+
+            # Standard OTLP: resource.attributes as list of {key, value}
             if isinstance(rs.get("resource", {}).get("attributes"), list):
-                for a in rs.get("resource", {}).get("attributes", []):
+                for a in rs["resource"]["attributes"]:
                     k = a.get("key")
                     v = a.get("value", {})
                     if isinstance(v, dict):
-                        res_attrs[k] = v.get("stringValue") or v.get("intValue") or v.get("boolValue") or ""
+                        res_attrs[k] = v.get("stringValue") or v.get("intValue") or v.get("boolValue") or v.get("doubleValue") or ""
                     else:
                         res_attrs[k] = v
+            # Standard OTLP: resource.attributes as plain dict
+            elif isinstance(rs.get("resource", {}).get("attributes"), dict):
+                res_attrs.update(rs["resource"]["attributes"])
+            # Claude / any flat: resource is itself a plain dict (no "attributes" sub-key)
+            elif isinstance(rs.get("resource"), dict) and "attributes" not in rs.get("resource", {}):
+                res_attrs.update(rs["resource"])
 
-            scope_spans = rs.get("scopeSpans", [])
+            # Scope spans — support both camelCase (OTLP) and snake_case (AWS)
+            scope_spans = rs.get("scopeSpans") or rs.get("scope_spans", [])
+
+            # Claude flat single-span: synthesise a minimal scope_spans list
+            if rs.get("_claude_flat") and rs.get("_span"):
+                scope_spans = [{"spans": [rs["_span"]]}]
+
             for ss in scope_spans:
                 spans = ss.get("spans", [])
                 if not spans:
@@ -1443,22 +1803,96 @@ class OtlpForwarder:
                 # collector behaviour — one span per batch).
                 # Their token counts are stashed so the parent invocation span
                 # (arriving in a later request) can pick them up via _pop_usage.
+                #
+                # AWS Bedrock AgentCore infra spans (memory R/W, HTTP calls) and
+                # Strands internal spans are also subordinate — never forward them
+                # as top-level WXO traces.
                 _SUBORDINATE_SPAN_NAMES = {
+                    # ── Anthropic ────────────────────────────────────────────
                     "anthropic.model_request",
                     "anthropic.model_response",
+                    # ── AWS Strands ──────────────────────────────────────────
+                    "execute_event_loop_cycle",   # internal loop span
+                    "POST /invocations",          # HTTP entry-point
+                    # ── Azure AI Foundry / Semantic Kernel ───────────────────
+                    # OpenAI / Azure OpenAI completion sub-spans emitted by the
+                    # az.ai.inference / openai SDK instrumentation layer.
+                    # The agent-level span (create_agent_invocation / run_step)
+                    # is the one we forward; these are its LLM implementation details.
+                    "openai.chat",
+                    "az.ai.inference.chat",
+                    "ChatCompletionsClient.complete",
+                    "AzureOpenAI.chat.completions.create",
+                    "openai.responses.create",
+                    # Azure Assistants API polling/thread sub-spans
+                    "azure.ai.agent.create_run",
+                    "azure.ai.agent.poll_run",
+                    "azure.ai.agent.list_run_steps",
+                    "azure.ai.agent.retrieve_run",
+                    # ── Vertex AI (Gemini) ───────────────────────────────────
+                    # gRPC / REST underlying calls emitted by google-cloud-aiplatform
+                    "google.cloud.aiplatform.prediction",
+                    "google.cloud.aiplatform.generate_content",
+                    "PredictionServiceClient.generate_content",
+                    "PredictionServiceClient.stream_generate_content",
                 }
+
+                # Subordinate span name *prefixes* (case-sensitive).
+                _SUBORDINATE_SPAN_PREFIXES = (
+                    # AWS Bedrock AgentCore SDK auto-instrumentation
+                    "Bedrock AgentCore.",
+                    # AWS Bedrock Runtime LLM calls (e.g. "chat us.amazon.nova-lite-v1:0")
+                    "chat ",
+                    # Azure HTTP/gRPC underlying calls
+                    "GET https://",
+                    "POST https://",
+                    "PATCH https://",
+                    # Vertex gRPC service calls
+                    "google.cloud.",
+                )
 
                 # Span names that are the top-level agent invocation.  A span with
                 # its parent inside the same payload is still forwarded if its name
                 # is in this set (edge case: batched payloads).
                 _AGENT_INVOCATION_SPAN_NAMES = {
+                    # ── Anthropic ────────────────────────────────────────────
                     "anthropic.session.turn",
                     "anthropic.sessions.events.send",
+                    "anthropic.messages.create",
+                    # ── Generic ──────────────────────────────────────────────
                     "invoke_agent",
                     "agent.invoke",
                     "chain",
                     "llm",
+                    # ── Azure AI Foundry / Semantic Kernel ───────────────────
+                    # Semantic Kernel agent invocation root span
+                    "microsoft.semantic_kernel.agent.invoke",
+                    "create_agent_invocation",   # Azure AI Foundry Responses SDK
+                    "agent_run",                 # Azure AI Foundry Assistants SDK
+                    "run_step",                  # granular Assistants run-step span
+                    # ── Vertex AI ────────────────────────────────────────────
+                    # ADK (Agent Development Kit) agent root span
+                    "vertex_ai.agent.invoke",
+                    "adk.agent.invoke",
                 }
+
+                # Invocation span name *prefixes* — a span whose name starts with
+                # one of these is treated as a top-level agent invocation even when
+                # it has a parent in the same payload.
+                _AGENT_INVOCATION_PREFIXES = (
+                    "invoke_agent ",          # AWS Strands / generic
+                    "generate_content ",      # Vertex Gemini direct SDK (no ADK)
+                )
+
+                def _is_subordinate(name: str) -> bool:
+                    if name in _SUBORDINATE_SPAN_NAMES:
+                        return True
+                    return any(name.startswith(p) for p in _SUBORDINATE_SPAN_PREFIXES)
+
+                def _is_invocation(name: str) -> bool:
+                    if name in _AGENT_INVOCATION_SPAN_NAMES:
+                        return True
+                    return any(name.startswith(p) for p in _AGENT_INVOCATION_PREFIXES)
 
                 # Second pass: process root / invocation spans
                 for sp in spans:
@@ -1475,7 +1909,7 @@ class OtlpForwarder:
                     # regardless of whether their parent is in this payload.
                     # This handles the common case where each span arrives in its
                     # own HTTP request from the OTel collector.
-                    if sp_name in _SUBORDINATE_SPAN_NAMES:
+                    if _is_subordinate(sp_name):
                         _sub_attrs = self._flatten_attributes(sp.get("attributes"))
                         _sub_it = int(_sub_attrs.get("gen_ai.usage.input_tokens") or 0)
                         _sub_ot = int(_sub_attrs.get("gen_ai.usage.output_tokens") or 0)
@@ -1489,7 +1923,7 @@ class OtlpForwarder:
                     if (
                         p_id
                         and p_id in span_by_id
-                        and sp_name not in _AGENT_INVOCATION_SPAN_NAMES
+                        and not _is_invocation(sp_name)
                     ):
                         continue
 
@@ -1555,6 +1989,11 @@ class OtlpForwarder:
                     events = sp.get("events", [])
                     event_prompts: list[str] = []
                     event_responses: list[str] = []
+                    reasoning_steps: list[str] = []
+                    # Scores that arrive as span events (e.g. LangChain eval callbacks,
+                    # Phoenix/Arize eval exporters).  Merged with attribute-level scores
+                    # before posting to WXO.
+                    event_score_attrs: dict = {}
 
                     for evt in events:
                         e_attrs = self._flatten_attributes(evt.get("attributes"))
@@ -1579,6 +2018,47 @@ class OtlpForwarder:
                         elif e_name in ("gen_ai.tool.message", "tool_result"):
                             if e_content:
                                 event_prompts.append(f"[tool_result]: {e_content}")
+                        elif e_name in (
+                            "gen_ai.reasoning", "gen_ai.thinking",
+                            "anthropic.thinking", "model.reasoning",
+                        ):
+                            # Reasoning / chain-of-thought content — becomes a
+                            # Langfuse ``steps`` entry of type "reasoning".
+                            r_text = (
+                                e_attrs.get("gen_ai.reasoning.content")
+                                or e_attrs.get("thinking")
+                                or e_content
+                            )
+                            if r_text:
+                                reasoning_steps.append(str(r_text))
+                        elif e_name.startswith(("eval.", "eval.score.", "langfuse.score.", "score.", "llm.eval.")):
+                            # Eval framework emitting scores as named span events
+                            # (e.g. "eval.relevance" event with value in attributes).
+                            score_val = (
+                                e_attrs.get("value")
+                                or e_attrs.get("score")
+                                or e_attrs.get("result")
+                                or e_content
+                            )
+                            if score_val not in (None, ""):
+                                event_score_attrs[e_name] = score_val
+                        else:
+                            # Generic: any event whose attributes carry eval.* keys
+                            # (e.g. Phoenix SpanEvaluations use event attrs).
+                            for ek, ev in e_attrs.items():
+                                if ek.lower().startswith(("eval.", "score.", "langfuse.score.", "llm.eval.")):
+                                    event_score_attrs.setdefault(ek, ev)
+
+                    # Also pick up reasoning from span attributes directly
+                    # (e.g. Anthropic SDK extended-thinking attribute, or
+                    # LangChain/LangGraph additional_kwargs["reasoning"]).
+                    _attr_reasoning = (
+                        attrs.get("gen_ai.reasoning.content")
+                        or attrs.get("anthropic.thinking")
+                        or attrs.get("model.reasoning")
+                    )
+                    if _attr_reasoning and _attr_reasoning not in reasoning_steps:
+                        reasoning_steps.append(str(_attr_reasoning))
 
                     if not prompt and event_prompts:
                         prompt = "\n".join(event_prompts)
@@ -1596,8 +2076,23 @@ class OtlpForwarder:
 
                     candidate_keys = [
                         explicit_agent_id,
+                        # AWS Strands/AgentCore: harness runtime ID (most specific)
                         attrs.get("aws.agent.runtime.id"),
                         res_attrs.get("aws.agent.runtime.id"),
+                        # AWS WXO-native agent IDs from resource_attrs
+                        res_attrs.get("wxo.agent.id"),
+                        res_attrs.get("wxo.agent.name"),
+                        # Azure AI Foundry / Semantic Kernel agent IDs
+                        attrs.get("az.ai.agent.id"),
+                        attrs.get("azure.client.agent.id"),
+                        attrs.get("az.ai.agent.name"),
+                        res_attrs.get("az.ai.agent.id"),
+                        res_attrs.get("azure.client.agent.id"),
+                        # Vertex AI / GCP — project-scoped agent name
+                        res_attrs.get("gcp.resource.type"),
+                        attrs.get("vertex_ai.agent.id"),
+                        attrs.get("gcp.agent.id"),
+                        # Generic
                         attrs.get("agent.id"),
                         attrs.get("agent_id"),
                         attrs.get("gen_ai.agent.id"),
@@ -1651,9 +2146,28 @@ class OtlpForwarder:
                     api_key = routing["api_key"]
                     token_url = routing["token_url"]
                     env_name = routing["environment"]
+                    # Override environment from AWS resource_attrs if present
+                    if res_attrs.get("wxo.environment"):
+                        env_name = res_attrs["wxo.environment"]
                     clean_name = routing["agent_name"]
-                    if attrs.get("gen_ai.provider.name") == "anthropic" and attrs.get("gen_ai.agent.name"):
-                        clean_name = re.sub(r"[^a-zA-Z0-9_-]", "_", str(attrs["gen_ai.agent.name"])).lower()
+                    # Anthropic Sessions SDK sets gen_ai.provider.name="anthropic" on spans;
+                    # the direct Messages API does not — fall back to checking gen_ai.system
+                    # so agent names resolve correctly for both paths.
+                    _is_anthropic = (
+                        attrs.get("gen_ai.provider.name") == "anthropic"
+                        or (attrs.get("gen_ai.system") or "").lower() in ("anthropic", "claude-platform")
+                        or (res_attrs.get("gen_ai.system") or "").lower() in ("anthropic", "claude-platform")
+                    )
+                    _anthropic_name = (
+                        attrs.get("gen_ai.agent.name")
+                        or res_attrs.get("gen_ai.agent.name")
+                        or res_attrs.get("agent.name")
+                    )
+                    if _is_anthropic and _anthropic_name:
+                        clean_name = re.sub(r"[^a-zA-Z0-9_-]", "_", str(_anthropic_name)).lower()
+                    # AWS Strands: use wxo.agent.name from resource_attrs as display name
+                    if res_attrs.get("wxo.agent.name") and not clean_name:
+                        clean_name = re.sub(r"[^a-zA-Z0-9_-]", "_", str(res_attrs["wxo.agent.name"])).lower()
 
                     if not agent_id or not export_url or not auth_configured(api_key):
                         log.warning(
@@ -1689,6 +2203,15 @@ class OtlpForwarder:
                         or attrs.get("conversation.id")
                         or attrs.get("anthropic.session_id")
                         or attrs.get("langfuse.session.id")
+                        # Azure AI Foundry: Assistants thread / Responses session
+                        or attrs.get("az.ai.agent.thread.id")
+                        or attrs.get("gen_ai.conversation.id")
+                        or attrs.get("azure.session.id")
+                        # Vertex AI ADK: session identifier
+                        or attrs.get("vertex_ai.session.id")
+                        or attrs.get("adk.session.id")
+                        # AWS Strands: harness.id as session fallback
+                        or attrs.get("harness.id")
                         or ""
                     )
                     user_id = (
@@ -1696,13 +2219,23 @@ class OtlpForwarder:
                         or attrs.get("user_id")
                         or attrs.get("langfuse.user.id")
                         or attrs.get("anthropic.user_id")
+                        # Azure: end-user identifier
+                        or attrs.get("az.ai.agent.user_id")
+                        or attrs.get("azure.user.id")
+                        # Anthropic org/workspace as user context fallback
+                        or attrs.get("anthropic.organization.id")
                         or ""
                     )
 
                     start_ns = int(sp.get("startTimeUnixNano") or sp.get("start_time_unix_nano") or time.time() * 1e9)
                     end_ns = int(sp.get("endTimeUnixNano") or sp.get("end_time_unix_nano") or (start_ns + 1_000_000))
 
-                    status_code = sp.get("status", {}).get("code", 0)
+                    _status = sp.get("status", {})
+                    # status may be a dict {"code": 2} or a plain string "ERROR"/"OK"
+                    if isinstance(_status, dict):
+                        status_code = _status.get("code", 0)
+                    else:
+                        status_code = 2 if str(_status).upper() in ("ERROR", "STATUS_CODE_ERROR") else 0
                     is_err = status_code == 2
 
                     tool_calls = child_tools_by_parent.get(sp_id, [])
@@ -1721,13 +2254,14 @@ class OtlpForwarder:
                         output_tokens=ot,
                         is_error=is_err,
                         error_msg=attrs.get("error.message", ""),
-                        platform=res_attrs.get("service.name") or "external_agent",
+                        platform=_resolve_platform(attrs, res_attrs),
                         model_name=str(model_name),
                         session_id=str(session_id),
                         trace_id=sp.get("traceId") or sp.get("trace_id", ""),
                         span_id=sp_id,
                         user_id=str(user_id),
                         tool_calls=tool_calls,
+                        reasoning_steps=reasoning_steps or None,
                     )
 
                     # Get IAM token and ship
@@ -1743,6 +2277,23 @@ class OtlpForwarder:
                         )
                         if job_id:
                             job_ids.append(job_id)
+                            # Post any conversation-level scores (relevance, toxicity,
+                            # faithfulness, etc.) extracted from span attributes AND
+                            # from span events (eval framework callbacks).
+                            # event_score_attrs collected in the event loop above is
+                            # merged here so both sources are captured.
+                            merged_score_attrs = {**attrs, **event_score_attrs}
+                            span_scores = self._extract_scores(merged_score_attrs)
+                            if span_scores:
+                                post_scores_to_wxo(
+                                    scores=span_scores,
+                                    trace_id=job_id,
+                                    bearer_token=token,
+                                    export_url=export_url,
+                                    agent_id=agent_id,
+                                    tenant_id=tenant_id,
+                                    logger=log,
+                                )
                     else:
                         log.error(f"Failed to obtain bearer token for agent {agent_id}")
 
@@ -1788,3 +2339,73 @@ class OtlpForwarder:
                     res[k] = v
             return res
         return {}
+
+    @staticmethod
+    def _extract_scores(attrs: dict) -> list[dict]:
+        """
+        Extract Langfuse-compatible score objects from a flattened span attribute
+        dict.  Recognised attribute patterns (all case-insensitive key prefixes):
+
+          eval.<name>                  e.g. eval.relevance = 0.92
+          eval.score.<name>            e.g. eval.score.toxicity = 0.01
+          langfuse.score.<name>        e.g. langfuse.score.coherence = 1.0
+          score.<name>                 e.g. score.faithfulness = 0.87
+          llm.eval.<name>              e.g. llm.eval.groundedness = 0.75
+
+        The value may be:
+          - A float/int  → NUMERIC score
+          - A string that looks like a float  → NUMERIC score
+          - Any other string  → CATEGORICAL score with value=0
+
+        Returns a list of score dicts ready for ``post_scores_to_wxo``.
+        """
+        _SCORE_PREFIXES = (
+            "eval.",
+            "eval.score.",
+            "langfuse.score.",
+            "score.",
+            "llm.eval.",
+        )
+        scores: list[dict] = []
+        seen: set[str] = set()
+
+        for raw_key, raw_val in attrs.items():
+            key_lower = (raw_key or "").lower()
+            matched_prefix = ""
+            for pfx in _SCORE_PREFIXES:
+                if key_lower.startswith(pfx):
+                    matched_prefix = pfx
+                    break
+            if not matched_prefix:
+                continue
+
+            score_name = raw_key[len(matched_prefix):]  # preserve original casing
+            if not score_name or score_name in seen:
+                continue
+            seen.add(score_name)
+
+            # Determine numeric value and data type
+            try:
+                numeric_val = float(raw_val)
+                data_type = "NUMERIC"
+                string_val = None
+            except (TypeError, ValueError):
+                # Categorical — keep the string, set numeric value to 0
+                numeric_val = 0.0
+                data_type = "CATEGORICAL"
+                string_val = str(raw_val) if raw_val not in (None, "") else None
+
+            entry: dict = {
+                "name":     score_name,
+                "value":    numeric_val,
+                "dataType": data_type,
+                "source":   "API",
+                "comment":  None,
+                "metadata": {},
+            }
+            if string_val is not None:
+                entry["stringValue"] = string_val
+
+            scores.append(entry)
+
+        return scores
