@@ -506,6 +506,7 @@ def _prompt_step4_app_settings() -> None:
 
     settings = [
         f"LOG_ANALYTICS_WORKSPACE_ID={LOG_ANALYTICS_WORKSPACE_ID}",
+        f"PROJECT_ENDPOINT={PROJECT_ENDPOINT}",   # authoritative token usage via GET /responses/{id}
         *[f"{k}={v}" for k, v in _wxo_auth_settings().items()],
         f"WXO_ENVIRONMENT_NAME={_WXO_ENVIRONMENT}",
         f"WXO_AGENT_MAP={final_map}",
