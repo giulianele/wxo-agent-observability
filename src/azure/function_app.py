@@ -327,6 +327,53 @@ def _post_to_wxo(payload: dict, bearer_token: str, agent_id: str, tenant_id: str
         raise RuntimeError(f"WXO POST failed: {exc.reason}") from exc
 
 
+def _post_scores_to_wxo(
+    scores: list[dict],
+    bearer_token: str,
+    agent_id: str,
+    agent_name: str,
+    trace_id: str,
+    tenant_id: str,
+    export_url: str,
+) -> None:
+    """POST evaluation scores to the WXO scores endpoint.
+
+    Derives the scores URL from *export_url* by replacing
+    ``inject/traces`` with ``inject/scores``.  Silently skips when
+    *scores* is empty or the URL cannot be derived.
+    """
+    if not scores:
+        return
+    scores_url = export_url.replace("inject/traces", "inject/scores")
+    if scores_url == export_url:
+        logger.warning("[WXO] Cannot derive scores URL from export_url — skipping score POST")
+        return
+
+    stamped: list[dict] = []
+    for sc in scores:
+        entry = dict(sc)
+        entry.setdefault("traceId",    trace_id)
+        entry.setdefault("agentId",    agent_id)
+        entry.setdefault("agentName",  agent_name)
+        stamped.append(entry)
+
+    body = json.dumps({"scores": stamped}).encode()
+    headers = {
+        "Authorization":   f"Bearer {bearer_token}",
+        "Content-Type":    "application/json",
+        "User-Agent":      "curl/7.68.0",
+        "x-ibm-agent-id":  agent_id,
+    }
+    if _deployment_mode() == "cloud":
+        headers["x-ibm-tenant-id"] = tenant_id
+    req = Request(scores_url, data=body, headers=headers, method="POST")
+    try:
+        with urlopen(req, timeout=30, context=_ssl_context()) as resp:
+            logger.info(f"[WXO] scores POST {resp.status} trace_id={trace_id} n={len(stamped)}")
+    except Exception as exc:
+        logger.warning(f"[WXO] scores POST failed: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Cursor — Blob REST API (stdlib urllib only, no SDK)
 # ---------------------------------------------------------------------------
@@ -466,15 +513,33 @@ def _query_new_invocations(since: str) -> list[dict]:
     # (due to App Insights ingestion lag) are still picked up.  TimeGenerated can be
     # several minutes behind ingestion_time(), so a row with TimeGenerated before
     # `since` would previously fall outside the window and be silently dropped.
+    # The invoke_agent row carries no usage or tool data.  The `chat` row (token usage)
+    # and the `execute_tool` rows (arguments / result) share its gen_ai.response.id, so
+    # they are joined in here to report real tokens and tool calls instead of estimates.
     kql = f"""
+let detail = AppGenAIContent
+| where ingestion_time() > ago({_POLL_WINDOW_MIN}m)
+| extend d = parse_json(Attributes)
+| extend rid = tostring(d['gen_ai.response.id']), dop = tostring(d['gen_ai.operation.name'])
+| where isnotempty(rid);
+let tool_rows = detail
+| where dop == 'execute_tool'
+| summarize ToolCalls = make_list(bag_pack('name', tostring(d['gen_ai.tool.name']), 'input', ToolCallArguments, 'output', ToolCallResult)) by rid;
+let usage_rows = detail
+| where dop == 'chat'
+| summarize chat_in = sum(toint(d['gen_ai.usage.input_tokens'])), chat_out = sum(toint(d['gen_ai.usage.output_tokens'])) by rid;
 AppGenAIContent
 | where ingestion_time() > datetime('{since}')
 | where ingestion_time() > ago({_POLL_WINDOW_MIN}m)
 | where parse_json(Attributes)['gen_ai.operation.name'] == 'invoke_agent'
 | extend attrs = parse_json(Attributes)
+| extend rid = tostring(attrs['gen_ai.response.id'])
+| join kind=leftouter tool_rows on rid
+| join kind=leftouter usage_rows on rid
 | project
     TimeGenerated,
     IngestTime     = ingestion_time(),
+    response_id    = rid,
     TraceId,
     AgentName,
     InputMessages,
@@ -482,8 +547,9 @@ AppGenAIContent
     session_id = tostring(coalesce(attrs['gen_ai.conversation.id'], attrs['thread.id'], attrs['conversation.id'], attrs['session.id'])),
     user_id = tostring(coalesce(attrs['langfuse.user.id'], attrs['user.id'])),
     model_name = tostring(coalesce(attrs['gen_ai.response.model'], attrs['gen_ai.request.model'], attrs['llm.model_name'])),
-    input_tokens  = toint(coalesce(attrs['gen_ai.usage.input_tokens'], attrs['gen_ai.usage.prompt_tokens'])),
-    output_tokens = toint(coalesce(attrs['gen_ai.usage.output_tokens'], attrs['gen_ai.usage.completion_tokens']))
+    input_tokens  = toint(coalesce(attrs['gen_ai.usage.input_tokens'], attrs['gen_ai.usage.prompt_tokens'], chat_in)),
+    output_tokens = toint(coalesce(attrs['gen_ai.usage.output_tokens'], attrs['gen_ai.usage.completion_tokens'], chat_out)),
+    ToolCalls
 | order by IngestTime asc
 """
     token = _get_la_token()
@@ -504,6 +570,56 @@ AppGenAIContent
         return []
     cols = [c["name"] for c in tables[0]["columns"]]
     return [dict(zip(cols, row)) for row in tables[0]["rows"]]
+
+
+
+_AI_TOKEN_CACHE: dict = {}
+
+
+def _get_ai_token() -> str:
+    """Token for the Foundry project data plane (https://ai.azure.com)."""
+    now = time.time()
+    if _AI_TOKEN_CACHE.get("token") and now < _AI_TOKEN_CACHE.get("expires_at", 0):
+        return _AI_TOKEN_CACHE["token"]
+    resource = "https://ai.azure.com"
+    ep, hdr = os.environ.get("IDENTITY_ENDPOINT", ""), os.environ.get("IDENTITY_HEADER", "")
+    if ep and hdr:
+        req = Request(f"{ep}?api-version=2019-08-01&resource={resource}")
+        req.add_header("X-IDENTITY-HEADER", hdr)
+        with urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read())
+        token, ttl = body["access_token"], max(int(body.get("expires_in", 3600)) - 300, 60)
+    else:
+        import subprocess
+        token = subprocess.run(["az", "account", "get-access-token", "--resource", resource,
+                                "--query", "accessToken", "-o", "tsv"],
+                               capture_output=True, text=True, check=True).stdout.strip()
+        ttl = 3300
+    _AI_TOKEN_CACHE.update(token=token, expires_at=now + ttl)
+    return token
+
+
+def _fetch_response_usage(response_id: str) -> tuple[int, int] | None:
+    """Authoritative (input, output) tokens for a Responses-API call.
+
+    The telemetry `chat` row only covers the final model turn, so a call that ran a
+    tool (code interpreter, ...) under-reports output tokens.  GET /responses/{id}
+    returns the usage summed over every model turn.  Returns None when unavailable
+    so the caller falls back to the telemetry numbers.
+    """
+    endpoint = os.environ.get("PROJECT_ENDPOINT", "").rstrip("/")
+    if not (endpoint and response_id):
+        return None
+    try:
+        req = Request(f"{endpoint}/openai/v1/responses/{response_id}",
+                      headers={"Authorization": f"Bearer {_get_ai_token()}"})
+        with urlopen(req, timeout=10, context=ssl.create_default_context()) as resp:
+            usage = json.loads(resp.read()).get("usage") or {}
+        i, o = int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0)
+        return (i, o) if (i or o) else None
+    except Exception as exc:
+        logger.warning(f"[USAGE] response usage lookup failed for {response_id}: {exc}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -601,6 +717,9 @@ def _row_to_event(row: dict) -> dict:
 
     input_tokens  = int(row.get("input_tokens")  or 0)
     output_tokens = int(row.get("output_tokens") or 0)
+    _api_usage = _fetch_response_usage(str(row.get("response_id") or ""))
+    if _api_usage:
+        input_tokens, output_tokens = _api_usage
     tokens_estimated = input_tokens == 0 and output_tokens == 0
 
     # KQL only exposes TimeGenerated (log arrival time), not the real span start/end, so
@@ -694,34 +813,97 @@ def _build_otlp_payload(
     def _sv(k, v): return {"key": k, "value": {"stringValue": str(v)}}
     def _iv(k, v): return {"key": k, "value": {"intValue": int(v)}}
 
+    # Structured WXO message envelope — matches the shape emitted by wxo-server's
+    # LangGraph pipeline so the Langfuse UI renders a rich input object on the trace.
+    _input_envelope = json.dumps({
+        "role": "user",
+        "content": parsed["prompt"],
+        "mentions": None,
+        "document_ids": None,
+        "parent_message_id": None,
+        "additional_properties": {
+            "wxa_message": None,
+            "display_properties": None,
+            "tool_calls": None,
+            "tool_call_id": None,
+            "tool_name": None,
+            "wxo_connection_status": None,
+            "log_id": None,
+            "captured_logs": None,
+            "is_interrupt": False,
+            "tool_flow_properties": None,
+            "architect_conversational_state": None,
+            "current_workflow": None,
+            "metadata": None,
+            "agent_id": None,
+            "a2a_task_completed": False,
+            "error_code": None,
+        },
+        "assistant_id": None,
+        "context": None,
+        "step_history": None,
+        "message_state": None,
+        "log_id": None,
+        "meta": None,
+        "user_defined": None,
+        "session_id": session_id,
+        "trace_id": None,
+    })
+
     # ── Root span attributes ──────────────────────────────────────────────────
     attributes = [
         _sv("agent.id",              agent_id),
         _sv("agent.name",            agent_name),
         _sv("agent.display_name",    agent_display_name),
+        _sv("agent.version",         "1"),
         _sv("gen_ai.operation.name", "invoke_agent"),
         _sv("gen_ai.agent.id",       agent_id),
         _sv("gen_ai.agent.name",     agent_name),
         _sv("thread.id",             session_id),
         _sv("conversation.id",       session_id),
+        _sv("session.id",            session_id),
         _sv("langfuse.session.id",   session_id),
         _sv("langfuse.user.id",      user_id),
         _sv("message.id",            message_id),
         _sv("environment.name",      environment),
+        _sv("environment.id",        environment),
+        _sv("workspace.id",          "00000000-0000-0000-0000-000000000001"),
+        _sv("instance.id",           tenant_id),
+        _sv("tenant.id",             tenant_id),
+        # WXO facet attributes — tag generation and routing
+        _sv("wxo.facet.tenant_id",    tenant_id),
+        _sv("wxo.facet.workspace_id", "00000000-0000-0000-0000-000000000001"),
+        _sv("wxo.facet.agent_id",     agent_id),
+        _sv("wxo.facet.workflow_id",  span_name),
+        _sv("wxo.channel.name",       "external_agent"),
+        _sv("wxo.channel.type",       "text"),
+        # Langfuse trace-level markers
+        _sv("langfuse.internal.as_root", "true"),
+        _sv("langfuse.trace.name",    span_name),
+        _sv("langfuse.tags",          json.dumps([
+            f"agent_id:{agent_id}",
+            f"environment:{environment}",
+            f"tenant_id:{tenant_id}",
+            "workspace_id:00000000-0000-0000-0000-000000000001",
+        ])),
+        _sv("is.root",                "true"),
+        _sv("global_transaction_id",  trace_id),
         # Primary I/O — server enrichment reads these to produce langfuse.observation.*
         _sv("gen_ai.input.messages",  input_messages),
         _sv("gen_ai.output.messages", output_messages),
+        # Structured WXO message envelope — gives the Langfuse trace a rich input object
+        _sv("gen_ai.message.input",   _input_envelope),
         # Flat-string copies for ClickHouse / backwards-compat
         _sv("input.value",  parsed["prompt"]),
         _sv("output.value", parsed["response"]),
         _sv("gen_ai.task.input",  parsed["prompt"]),
         _sv("gen_ai.task.output", parsed["response"]),
-        _sv("langfuse.trace.name", span_name),
-        _sv("is.root",             "true"),
         _sv("input",               parsed["prompt"]),
         _sv("output",              parsed["response"]),
-        _sv("llm.model_name",      _model),
-        _sv("gen_ai.request.model", _model),
+        _sv("llm.model_name",        _model),
+        _sv("model",                 _model),
+        _sv("gen_ai.response.model", _model),
+        _sv("gen_ai.request.model",  _model),
         _sv("llm.system",          "azure_ai_foundry"),
         _sv("gen_ai.system",       "azure_ai_foundry"),
         _sv("framework",           "azure_ai_foundry"),
@@ -775,7 +957,7 @@ def _build_otlp_payload(
     _gen_start = _llm_start + max(500_000, (_llm_end - _llm_start) // 20)
     _gen_end   = _llm_end   - max(500_000, (_llm_end - _llm_start) // 20)
     _llm_attrs = [
-        _sv("openinference.span.kind",         "LLM"),
+        _sv("openinference.span.kind",         "CHAIN"),
         _sv("gen_ai.system",                   "azure_ai_foundry"),
         _sv("gen_ai.request.model",            _model),
         _sv("llm.model_name",                  _model),
@@ -835,8 +1017,8 @@ def _build_otlp_payload(
                 _sv("gen_ai.tool.name",        str(_tc.get("name", f"tool_{_i}"))),
                 *([_sv("tool.parameters", str(_tc["input"])[:2000]),
                    _sv("input.value",     str(_tc["input"])[:2000])] if _tc.get("input") else []),
-                *([_sv("tool.output",  str(_tc["output"])[:2000]),
-                   _sv("output.value", str(_tc["output"])[:2000])] if _tc.get("output") else []),
+                # NB: no output.value on TOOL spans — WXO drops the span.
+                *([_sv("tool.output",  str(_tc["output"])[:2000])] if _tc.get("output") else []),
             ],
         }
         for _i, _tc in enumerate(_tool_calls)
@@ -888,19 +1070,23 @@ def _build_otlp_payload(
     return {
         "resourceSpans": [{
             "resource": {"attributes": [
-                _sv("service.name",           agent_name),
-                _sv("service.version",        "1.0.0"),
-                _sv("tenant.id",              tenant_id),
-                _sv("agent.id",               agent_id),
-                _sv("agent.name",             agent_name),
-                _sv("agent.display_name",     agent_display_name),
-                _sv("gen_ai.agent.id",        agent_id),
-                _sv("gen_ai.agent.name",      agent_name),
-                _sv("environment.name",       environment),
-                _sv("deployment.environment", environment),
+                _sv("service.name",              agent_name),
+                _sv("service.version",           "1.0.0"),
+                _sv("telemetry.sdk.language",    "python"),
+                _sv("telemetry.sdk.name",        "opentelemetry"),
+                _sv("telemetry.sdk.version",     "1.0.0"),
+                _sv("application",               agent_name),
+                _sv("tenant.id",                 tenant_id),
+                _sv("agent.id",                  agent_id),
+                _sv("agent.name",                agent_name),
+                _sv("agent.display_name",        agent_display_name),
+                _sv("gen_ai.agent.id",           agent_id),
+                _sv("gen_ai.agent.name",         agent_name),
+                _sv("environment.name",          environment),
+                _sv("deployment.environment",    environment),
             ]},
             "scopeSpans": [{
-                "scope": {"name": "a2a-python-sdk", "version": "2.0.0"},
+                "scope": {"name": "wxo-universal-forwarder", "version": "2.0.0"},
                 "spans": spans,
             }]
         }]
@@ -1032,6 +1218,20 @@ def _handle_row(row: dict) -> dict:
         model_name=parsed.get("model_name", ""),
     )
     job_id = _post_to_wxo(otlp_payload, bearer_token, agent_id, tenant_id, export_url=export_url)
+
+    # Extract eval scores from parsed attributes and post to WXO scores endpoint
+    _eval_scores: list[dict] = []
+    for _k, _v in (parsed.items() if isinstance(parsed, dict) else {}.items()):
+        if isinstance(_k, str) and _k.startswith(("eval.", "score.", "langfuse.score.")):
+            try:
+                _eval_scores.append({"name": _k, "value": float(_v)})
+            except (TypeError, ValueError):
+                pass
+    if _eval_scores:
+        _post_scores_to_wxo(
+            _eval_scores, bearer_token, agent_id, agent_name,
+            trace_id, tenant_id, export_url,
+        )
 
     logger.info(f"=== Done | trace_id={trace_id} | job_id={job_id} ===")
     return {"statusCode": 200, "trace_id": trace_id, "job_id": job_id, "spans": 1}
