@@ -140,10 +140,23 @@ print(snake or 'vertex_agent')")}"
 
     # Activate the service-account key so both docker pull (source repo) and
     # docker push (target repo) share the same authenticated identity.
-    if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && [ -f "${GOOGLE_APPLICATION_CREDENTIALS}" ]; then
-        gcloud auth activate-service-account \
-            --key-file="${GOOGLE_APPLICATION_CREDENTIALS}" --quiet 2>/dev/null \
-            && echo "  ✓ gcloud: activated SA from GOOGLE_APPLICATION_CREDENTIALS"
+    local _SA_KEY="${GCP_SERVICE_ACCOUNT_JSON:-${GOOGLE_APPLICATION_CREDENTIALS:-}}"
+    if [ -n "${_SA_KEY}" ]; then
+        if [ -f "${_SA_KEY}" ]; then
+            gcloud auth activate-service-account \
+                --key-file="${_SA_KEY}" --quiet 2>/dev/null \
+                && echo "  ✓ gcloud: activated SA from key file"
+        else
+            python3 -c "
+import base64, sys
+raw = sys.argv[1].strip()
+if raw.startswith('{'):
+    print(raw)
+else:
+    print(base64.b64decode(raw).decode('utf-8'))
+" "${_SA_KEY}" 2>/dev/null | gcloud auth activate-service-account --key-file=- --quiet 2>/dev/null \
+                && echo "  ✓ gcloud: activated SA from decoded credentials (in-memory)"
+        fi
     fi
 
     # Determine all registry hosts that need Docker credential helpers:
@@ -193,6 +206,15 @@ print(snake or 'vertex_agent')")}"
     #      otherwise falls back to API_KEY)
     # cloud: API key + token URL + tenant.  cpd: CPD_* login (no key / tenant).
     local _ENV_VARS
+    if [ "${WXO_DEPLOYMENT_MODE:-cloud}" != "cpd" ]; then
+        if [ -z "${WXO_TENANT_ID:-}" ] && [ -n "${WXO_OTEL_EXPORT_URL:-}" ]; then
+            if [[ "${WXO_OTEL_EXPORT_URL}" =~ /instances/([^/]+) ]]; then
+                WXO_TENANT_ID="${BASH_REMATCH[1]}"
+                WXO_TENANT_ID="${WXO_TENANT_ID%%\?*}"
+                WXO_TENANT_ID="${WXO_TENANT_ID%%\#*}"
+            fi
+        fi
+    fi
     if [ "${WXO_DEPLOYMENT_MODE:-cloud}" = "cpd" ]; then
         _ENV_VARS="WXO_DEPLOYMENT_MODE=cpd,\
 WXO_AGENT_ID=${WXO_AGENT_ID},\

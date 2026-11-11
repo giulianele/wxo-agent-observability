@@ -127,7 +127,7 @@ def cmd_deploy(a) -> None:
     endpoint = url.rstrip('/')
     print(f"\n✓ Forwarder deployed.")
     print(f"  Endpoint: {endpoint}")
-    print("  Auth: optional, off by default. Enable with FORWARDER_AUTH_TOKEN in config/forwarder.env, "
+    print("  Auth: optional, off by default. Enable with FORWARDER_AUTH_TOKEN in config/claude.env, "
           "or: forwarder_ctl.py auth rotate")
     print("  Next: 'wxo set', 'agent add'  (no redeploy needed)")
 
@@ -151,7 +151,7 @@ def cmd_auth(a) -> None:
 def cmd_wxo(a) -> None:
     s = ssm_get(SETTINGS_PARAM, a.region)
     if a.action == "set":
-        # Flags win; otherwise read the same env vars used in config/forwarder.env
+        # Flags win; otherwise read the same env vars used in config/claude.env
         env = os.environ.get
         updates = {"tenant_id": a.tenant_id or env("WXO_TENANT_ID"),
                    "otel_export_url": a.export_url or env("WXO_OTEL_EXPORT_URL"),
@@ -207,7 +207,7 @@ def main() -> None:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     d = sub.add_parser("deploy", parents=[common], help="Deploy/update the forwarder Lambda")
-    d.add_argument("--function-name", default=os.environ.get("AWS_LAMBDA_FUNCTION_NAME") or "wxo-agent-analytics-otlp-forwarder")
+    d.add_argument("--function-name", default=os.environ.get("AWS_LAMBDA_FUNCTION_NAME") or "wxo-otlp-forwarder-claude")
     d.set_defaults(fn=cmd_deploy)
 
     t = sub.add_parser("auth", parents=[common], help="Manage the token callers must present")

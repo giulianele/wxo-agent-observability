@@ -19,6 +19,16 @@ snake = re.sub(r'[^a-z0-9]+', '_', snake).strip('_')
 print(snake or 'aws_agentcore_agent')"
 }
 
+# ── Put an SSM parameter via python3/boto3 (overwrites if exists) ────────────
+# Args: <name> <value> <type: String|SecureString>
+ssm_put() {
+    python3 -c "
+import boto3, os, sys
+ssm = boto3.client('ssm', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
+ssm.put_parameter(Name=sys.argv[1], Value=sys.argv[2], Type=sys.argv[3], Overwrite=True)
+" "$1" "$2" "$3"
+}
+
 # ── Store per-agent WXO identity in SSM (keyed by runtime_id) ────────────────
 # Args: <runtime_id> <agent_name> <display_name>
 #
@@ -36,20 +46,9 @@ print(snake or 'aws_agentcore_agent')"
 write_ssm_identity() {
     local runtime_id="$1" agent_name="$2" display_name="$3"
 
-    aws ssm put-parameter --region "${AWS_REGION}" \
-        --name "${SSM_PREFIX}/agents/${runtime_id}/agent_id" \
-        --value "${WXO_AGENT_ID}" --type "SecureString" --overwrite \
-        --query "Version" --output text > /dev/null
-
-    aws ssm put-parameter --region "${AWS_REGION}" \
-        --name "${SSM_PREFIX}/agents/${runtime_id}/agent_name" \
-        --value "${agent_name}" --type "String" --overwrite \
-        --query "Version" --output text > /dev/null
-
-    aws ssm put-parameter --region "${AWS_REGION}" \
-        --name "${SSM_PREFIX}/agents/${runtime_id}/agent_display_name" \
-        --value "${display_name}" --type "String" --overwrite \
-        --query "Version" --output text > /dev/null
+    ssm_put "${SSM_PREFIX}/agents/${runtime_id}/agent_id"           "${WXO_AGENT_ID}" "SecureString"
+    ssm_put "${SSM_PREFIX}/agents/${runtime_id}/agent_name"         "${agent_name}"   "String"
+    ssm_put "${SSM_PREFIX}/agents/${runtime_id}/agent_display_name" "${display_name}" "String"
 
     # ── Multi-tenant routing — stored per runtime_id so the Lambda can serve
     #    any number of harness agents pointing to different WXO tenants without
@@ -57,23 +56,21 @@ write_ssm_identity() {
     #    CPD mode has no tenant header, so tenant_id is skipped; the Lambda builds
     #    the export URL from /wxo-agent/cpd/* when export_url is not stored.
     if [ "${WXO_DEPLOYMENT_MODE:-cloud}" != "cpd" ]; then
-        aws ssm put-parameter --region "${AWS_REGION}" \
-            --name "${SSM_PREFIX}/agents/${runtime_id}/tenant_id" \
-            --value "${WXO_TENANT_ID}" --type "SecureString" --overwrite \
-            --query "Version" --output text > /dev/null
+        if [ -z "${WXO_TENANT_ID:-}" ] && [ -n "${WXO_OTEL_EXPORT_URL:-}" ]; then
+            if [[ "${WXO_OTEL_EXPORT_URL}" =~ /instances/([^/]+) ]]; then
+                WXO_TENANT_ID="${BASH_REMATCH[1]}"
+                WXO_TENANT_ID="${WXO_TENANT_ID%%\?*}"
+                WXO_TENANT_ID="${WXO_TENANT_ID%%\#*}"
+            fi
+        fi
+        ssm_put "${SSM_PREFIX}/agents/${runtime_id}/tenant_id" "${WXO_TENANT_ID}" "SecureString"
     fi
 
     if [ -n "${WXO_OTEL_EXPORT_URL:-}" ]; then
-        aws ssm put-parameter --region "${AWS_REGION}" \
-            --name "${SSM_PREFIX}/agents/${runtime_id}/export_url" \
-            --value "${WXO_OTEL_EXPORT_URL}" --type "String" --overwrite \
-            --query "Version" --output text > /dev/null
+        ssm_put "${SSM_PREFIX}/agents/${runtime_id}/export_url" "${WXO_OTEL_EXPORT_URL}" "String"
     fi
 
-    aws ssm put-parameter --region "${AWS_REGION}" \
-        --name "${SSM_PREFIX}/agents/${runtime_id}/environment" \
-        --value "${ENVIRONMENT_NAME:-draft}" --type "String" --overwrite \
-        --query "Version" --output text > /dev/null
+    ssm_put "${SSM_PREFIX}/agents/${runtime_id}/environment" "${ENVIRONMENT_NAME:-draft}" "String"
 
     echo "  ✓ SSM  ${SSM_PREFIX}/agents/${runtime_id}/"
     echo "         agent_id           = ${WXO_AGENT_ID}"
@@ -230,9 +227,7 @@ _create_infra() {
         --region "${AWS_REGION}" --output text --query "Statement" > /dev/null 2>&1 || true
 
     # Cache API GW ID in SSM so future runs reuse it
-    aws ssm put-parameter --region "${AWS_REGION}" --name "${APIGW_SSM_KEY}" \
-        --value "${APIGW_ID}" --type "String" --overwrite \
-        --query "Version" --output text > /dev/null
+    ssm_put "${APIGW_SSM_KEY}" "${APIGW_ID}" "String"
 
     echo "  ✓ API Gateway created (ID: ${APIGW_ID})"
 }

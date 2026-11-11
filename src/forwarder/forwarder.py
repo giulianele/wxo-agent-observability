@@ -77,6 +77,15 @@ def cpd_export_url() -> str:
     return f"{host}/{ns}/instances/{iid}/v1/agentops-v3/traces" if host and ns and iid else ""
 
 
+def extract_tenant_id(export_url: str) -> str:
+    """Extract tenant/instance ID from an OTEL export URL."""
+    if export_url:
+        m = re.search(r'/instances/([^/?#]+)', export_url)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
 def auth_configured(api_key: str) -> bool:
     """True when credentials for the active mode are available."""
     if deployment_mode() == "cpd":
@@ -1133,10 +1142,10 @@ class OtlpForwarder:
     ):
         self.agent_map = agent_map if agent_map is not None else self.parse_agent_map()
         cpd = deployment_mode() == "cpd"
-        self.default_tenant_id = "" if cpd else (default_tenant_id or os.environ.get("WXO_TENANT_ID", "").strip())
         self.default_export_url = default_export_url or (
             cpd_export_url() if cpd else os.environ.get("WXO_OTEL_EXPORT_URL", "").strip()
         )
+        self.default_tenant_id = "" if cpd else (default_tenant_id or extract_tenant_id(self.default_export_url) or os.environ.get("WXO_TENANT_ID", "").strip())
         self.default_api_key = default_api_key or (os.environ.get("API_KEY") or os.environ.get("WXO_API_KEY", "")).strip()
         self.default_token_url = default_token_url or os.environ.get(
             "TOKEN_URL",
@@ -1186,8 +1195,8 @@ class OtlpForwarder:
                    "CPD_NAMESPACE", "CPD_VERIFY_TLS"):
             if s.get(_k.lower()):
                 os.environ[_k] = str(s[_k.lower()])
-        self.default_tenant_id = s.get("tenant_id") or self.default_tenant_id
         self.default_export_url = s.get("otel_export_url") or self.default_export_url
+        self.default_tenant_id = s.get("tenant_id") or extract_tenant_id(self.default_export_url) or self.default_tenant_id
         self.default_api_key = s.get("api_key") or self.default_api_key
         self.default_token_url = s.get("token_url") or self.default_token_url
         self.default_environment = s.get("environment") or self.default_environment
@@ -1454,8 +1463,8 @@ class OtlpForwarder:
         clean_name = re.sub(r"[^a-zA-Z0-9_-]", "_", agent_name).lower()
         display_name = map_entry.get("wxo_display_name") or map_entry.get("display_name") or clean_name
 
-        tenant_id = map_entry.get("wxo_tenant_id") or map_entry.get("tenant_id") or self.default_tenant_id
         export_url = map_entry.get("wxo_otel_export_url") or map_entry.get("otel_export_url") or self.default_export_url
+        tenant_id = map_entry.get("wxo_tenant_id") or map_entry.get("tenant_id") or extract_tenant_id(export_url) or self.default_tenant_id
         api_key = map_entry.get("wxo_api_key") or map_entry.get("api_key") or self.default_api_key
         token_url = map_entry.get("wxo_token_url") or map_entry.get("token_url") or self.default_token_url
         environment = map_entry.get("environment") or self.default_environment
@@ -2239,6 +2248,24 @@ class OtlpForwarder:
                     is_err = status_code == 2
 
                     tool_calls = child_tools_by_parent.get(sp_id, [])
+                    # Anthropic Managed Agents emit no child tool spans; the tool call is a
+                    # {"type":"tool_call","name":..,"arguments":..} part in gen_ai.output.messages
+                    # (content mode) of the turn that stops with "requires_action".
+                    if not tool_calls and "tool_call" in (attrs.get("gen_ai.output.messages") or ""):
+                        try:
+                            for _m in json.loads(attrs["gen_ai.output.messages"]):
+                                for _p in _m.get("parts") or []:
+                                    if isinstance(_p, dict) and _p.get("type") == "tool_call" and _p.get("name"):
+                                        tool_calls.append({
+                                            "name": _p["name"],
+                                            "input": json.dumps(_p.get("arguments") or {}),
+                                            "output": "",
+                                            "start_ns": start_ns,
+                                            "end_ns": end_ns,
+                                            "is_error": False,
+                                        })
+                        except (ValueError, AttributeError, TypeError):
+                            pass
 
                     # Construct WXO Payload
                     wxo_payload = build_otlp_payload(

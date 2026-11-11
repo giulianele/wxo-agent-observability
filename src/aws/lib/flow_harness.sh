@@ -68,6 +68,16 @@ print(d['harness']['environment']['agentCoreRuntimeEnvironment']['agentRuntimeId
     # pair here into every span it emits.
     local RESOURCE_ATTRS="aws.agent.runtime.id=${RUNTIME_ID},wxo.agent.id=${WXO_AGENT_ID},wxo.agent.name=${AGENT_NAME},wxo.environment=${ENVIRONMENT_NAME}"
 
+    if [ "${WXO_DEPLOYMENT_MODE:-cloud}" != "cpd" ]; then
+        if [ -z "${WXO_TENANT_ID:-}" ] && [ -n "${WXO_OTEL_EXPORT_URL:-}" ]; then
+            if [[ "${WXO_OTEL_EXPORT_URL}" =~ /instances/([^/]+) ]]; then
+                WXO_TENANT_ID="${BASH_REMATCH[1]}"
+                WXO_TENANT_ID="${WXO_TENANT_ID%%\?*}"
+                WXO_TENANT_ID="${WXO_TENANT_ID%%\#*}"
+            fi
+        fi
+    fi
+
     # Inject WXO_TENANT_ID and WXO_OTEL_EXPORT_URL directly as harness env
     # vars so the Lambda reads them from os.environ without any SSM call.
     # Values come from config/aws.env (WXO_TENANT_ID, WXO_OTEL_EXPORT_URL) —

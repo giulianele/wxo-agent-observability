@@ -2,7 +2,7 @@
 """
 parse_env_section.py  —  Helper to extract platform sections from config.env
 
-Supports section headers like [aws], [azure], [forwarder], [vertex], [salesforce]
+Supports section headers like [aws], [azure], [claude], [vertex], [salesforce]
 and provides:
   - 'sh': outputs bash export statements
   - 'json': outputs JSON
@@ -14,6 +14,24 @@ import json
 import os
 import re
 import sys
+
+
+def extract_tenant_id(url: str) -> str:
+    if url:
+        m = re.search(r'/instances/([^/?#]+)', url)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _populate_tenant_id(d: dict) -> None:
+    if isinstance(d, dict):
+        url = d.get("WXO_OTEL_EXPORT_URL", "")
+        tid = d.get("WXO_TENANT_ID", "")
+        if (not tid or "<" in tid) and url and "<" not in url:
+            extracted = extract_tenant_id(url)
+            if extracted:
+                d["WXO_TENANT_ID"] = extracted
 
 
 def parse_config(file_path: str, target_section: str = None) -> dict:
@@ -73,7 +91,7 @@ def parse_config(file_path: str, target_section: str = None) -> dict:
     for line in content.splitlines():
         stripped = line.strip()
 
-        # Match section header: e.g. [forwarder], [aws]
+        # Match section header: e.g. [claude], [aws]
         m_sec = re.match(r"^\s*\[\s*([A-Za-z0-9_-]+)\s*\]", stripped)
         if m_sec:
             save_current()
@@ -136,7 +154,9 @@ def parse_config(file_path: str, target_section: str = None) -> dict:
     save_current()
 
     if not has_sections:
-        return sections.get("global", {})
+        res = sections.get("global", {})
+        _populate_tenant_id(res)
+        return res
 
     if target_section:
         target_sec = target_section.strip().lower()
@@ -146,14 +166,23 @@ def parse_config(file_path: str, target_section: str = None) -> dict:
                 merged.update(sections[base])
         if target_sec in sections:
             merged.update(sections[target_sec])
+        _populate_tenant_id(merged)
         return merged
+
+    for sec_data in sections.values():
+        _populate_tenant_id(sec_data)
     return sections
+
+
+def _platform_cmd(p_key: str) -> str:
+    """Entrypoint command for a platform (azure/claude have dedicated scripts)."""
+    return f"./{p_key}.sh" if p_key in ("azure", "claude") else f"./wire_agent.sh --{p_key}"
 
 
 def print_status(file_path: str):
     all_sec = parse_config(file_path)
     platforms = [
-        ("forwarder", "OTLP Forwarder (Docker/Lambda/Azure)"),
+        ("claude", "Claude (OTLP Forwarder: Docker/Lambda/Azure)"),
         ("aws", "AWS AgentCore / Bedrock"),
         ("azure", "Azure AI Foundry"),
         ("vertex", "Vertex AI / Reasoning Engine"),
@@ -169,7 +198,7 @@ def print_status(file_path: str):
     for p_key, _ in platforms:
         sec = all_sec.get(p_key, {})
         if not sec:
-            print(f"  {p_key:<13} {'✗ Missing':<14} {'-':<22} {'-':<14} ./wire_agent.sh --{p_key}")
+            print(f"  {p_key:<13} {'✗ Missing':<14} {'-':<22} {'-':<14} {_platform_cmd(p_key)}")
             continue
 
         # Platform section overrides global/shared/default values (same as parse_config)
@@ -189,9 +218,10 @@ def print_status(file_path: str):
             required = ["CPD_HOST_URL", "CPD_USERNAME", "CPD_PASSWORD", "CPD_INSTANCE_ID", "CPD_NAMESPACE"]
             configured = all(_set(n) for n in required)
         else:
-            tid = merged.get("WXO_TENANT_ID", "")
+            url = merged.get("WXO_OTEL_EXPORT_URL", "")
+            tid = merged.get("WXO_TENANT_ID", "") or extract_tenant_id(url)
             tid_disp = "(unset)" if not tid or "<" in tid else (tid[:19] + "..." if len(tid) > 20 else tid)
-            configured = all(_set(n) for n in ("API_KEY", "WXO_OTEL_EXPORT_URL", "WXO_TENANT_ID"))
+            configured = all(_set(n) for n in ("API_KEY", "WXO_OTEL_EXPORT_URL")) and bool(tid and "<" not in tid)
 
         if configured:
             status_disp = "✓ Configured"
@@ -206,11 +236,11 @@ def print_status(file_path: str):
             pass
         map_disp = f"✓ {agents} agent(s)" if agents > 0 else "✗ None"
 
-        print(f"  {p_key:<13} {status_disp:<14} {tid_disp:<22} {map_disp:<14} ./wire_agent.sh --{p_key}")
+        print(f"  {p_key:<13} {status_disp:<14} {tid_disp:<22} {map_disp:<14} {_platform_cmd(p_key)}")
 
     print("\n  Quick Commands:")
-    print("    • Run a platform     : ./wire_agent.sh --<platform>")
-    print("    • Dry-run test       : ./wire_agent.sh --<platform> --dry-run")
+    print("    • Run a platform     : ./claude.sh | ./azure.sh | ./wire_agent.sh --<aws|vertex|salesforce>")
+    print("    • Dry-run test       : append --dry-run to any of the above")
     print("    • View configuration : ./wire_agent.sh --show <platform>")
     print("    • Edit configuration : edit config.env\n")
 
@@ -257,7 +287,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if out_mode == "show" or sec.startswith("--show"):
-        target = sys.argv[3] if len(sys.argv) > 3 else (sec.replace("--show=", "") if "=" in sec else "forwarder")
+        target = sys.argv[3] if len(sys.argv) > 3 else (sec.replace("--show=", "") if "=" in sec else "claude")
         print_show(cfg_file, target)
         sys.exit(0)
 

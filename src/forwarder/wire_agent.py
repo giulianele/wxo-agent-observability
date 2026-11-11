@@ -69,14 +69,14 @@ def _load_env_file(path: str, section: str = None) -> None:
 _repo_base = os.path.dirname(_repo_root)
 _cfg_dir = os.path.join(_repo_base, "config")
 if os.path.exists(os.path.join(_repo_base, "config.env")):
-    _load_env_file(os.path.join(_repo_base, "config.env"), "forwarder")
+    _load_env_file(os.path.join(_repo_base, "config.env"), "claude")
 elif os.path.exists(os.path.join(_cfg_dir, "config.env")):
-    _load_env_file(os.path.join(_cfg_dir, "config.env"), "forwarder")
+    _load_env_file(os.path.join(_cfg_dir, "config.env"), "claude")
 elif os.path.exists(os.path.join(_repo_base, ".env")):
-    _load_env_file(os.path.join(_repo_base, ".env"), "forwarder")
+    _load_env_file(os.path.join(_repo_base, ".env"), "claude")
 else:
     _load_env_file(os.path.join(_cfg_dir, "shared.env"))
-    _load_env_file(os.path.join(_cfg_dir, "forwarder.env"))
+    _load_env_file(os.path.join(_cfg_dir, "claude.env"))
 
 
 def _cfg(name: str, default: str = "") -> str:
@@ -85,8 +85,8 @@ def _cfg(name: str, default: str = "") -> str:
 
 OTLP_RECEIVER_PORT = int(_cfg("OTLP_PORT") or _cfg("PORT") or _cfg("OTLP_RECEIVER_PORT") or 4318)
 WXO_MODE           = deployment_mode()   # cloud | cpd (WXO_DEPLOYMENT_MODE)
-WXO_TENANT_ID      = "" if WXO_MODE == "cpd" else _cfg("WXO_TENANT_ID")
 WXO_OTEL_EXPORT_URL= cpd_export_url() if WXO_MODE == "cpd" else _cfg("WXO_OTEL_EXPORT_URL")
+WXO_TENANT_ID      = "" if WXO_MODE == "cpd" else (extract_tenant_id(WXO_OTEL_EXPORT_URL) or _cfg("WXO_TENANT_ID"))
 WXO_ENVIRONMENT    = _cfg("ENVIRONMENT_NAME", "draft")
 WXO_API_KEY        = _cfg("API_KEY") or _cfg("WXO_API_KEY")
 WXO_TOKEN_URL      = _cfg("TOKEN_URL", "https://account-iam.platform.saas.ibm.com/api/2.0/apikeys/token")
@@ -101,16 +101,17 @@ def validate_config(dry_run: bool = False) -> bool:
     if WXO_MODE == "cpd":
         for var in ("CPD_HOST_URL", "CPD_USERNAME", "CPD_PASSWORD", "CPD_INSTANCE_ID", "CPD_NAMESPACE"):
             if not _cfg(var):
-                errors.append(f"  ✗  {var} not set in config.env [forwarder] (WXO_DEPLOYMENT_MODE=cpd)")
+                errors.append(f"  ✗  {var} not set in config.env [claude] (WXO_DEPLOYMENT_MODE=cpd)")
     else:
         if not WXO_API_KEY:
-            errors.append("  ✗  API_KEY not set in config/shared.env or config/forwarder.env")
+            errors.append("  ✗  API_KEY not set in config/shared.env or config/claude.env")
         if not WXO_TOKEN_URL:
             errors.append("  ✗  TOKEN_URL not set in config/shared.env")
-        if not WXO_TENANT_ID and not os.environ.get("WXO_AGENT_MAP"):
-            errors.append("  ✗  WXO_TENANT_ID not set in config/forwarder.env")
         if not WXO_OTEL_EXPORT_URL and not os.environ.get("WXO_AGENT_MAP"):
-            errors.append("  ✗  WXO_OTEL_EXPORT_URL not set in config/forwarder.env")
+            errors.append("  ✗  WXO_OTEL_EXPORT_URL not set in config/claude.env")
+        if not WXO_TENANT_ID and not os.environ.get("WXO_AGENT_MAP"):
+            errors.append("  ✗  Tenant ID could not be extracted from WXO_OTEL_EXPORT_URL "
+                          "(expected '.../instances/<id>/...'); fix the URL or set WXO_TENANT_ID explicitly")
 
     agent_map = OtlpForwarder.parse_agent_map()
 
