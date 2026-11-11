@@ -238,6 +238,14 @@ def _build_cpd_export_url(cfg: dict) -> str:
     return ""
 
 
+def _extract_tenant_id(url: str) -> str:
+    if url:
+        m = re.search(r'/instances/([^/?#]+)', url)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
 def _get_agent_identity(runtime_id: str) -> dict:
     """
     Load per-agent WXO identity from SSM (written by wire_agent.sh / flow_harness.sh).
@@ -1741,8 +1749,8 @@ def lambda_handler(event: dict, context) -> dict:
     # its own tenant/URL in SSM keyed by its unique runtime_id — the Lambda never holds
     # any per-tenant state in its own environment.
     # cpd mode has no tenant — only the export URL (and credentials) are needed.
-    tenant_id   = (os.environ.get("WXO_TENANT_ID") or os.environ.get("TENANT_ID", "")).strip()
     export_url  = (os.environ.get("WXO_OTEL_EXPORT_URL") or os.environ.get("OTEL_EXPORT_URL", "")).strip()
+    tenant_id   = (os.environ.get("WXO_TENANT_ID") or os.environ.get("TENANT_ID", "")).strip() or _extract_tenant_id(export_url)
     environment = os.environ.get("WXO_ENVIRONMENT_NAME", "draft")
 
     # ── For harness (Flow A) OTLP pushes: resolve routing via runtime_id → SSM ─
@@ -1785,6 +1793,8 @@ def lambda_handler(event: dict, context) -> dict:
         _token_args = (cpd["username"], cpd["password"], cpd["host_url"])
         _fetch_token = _get_cpd_bearer_token
     else:
+        if not tenant_id and export_url:
+            tenant_id = _extract_tenant_id(export_url)
         if not tenant_id:
             logger.error("[HOOK] WXO_TENANT_ID not resolved — set via Lambda env (Flow B) or SSM per-runtime (Flow A)")
             return {"statusCode": 400, "message": "WXO_TENANT_ID not configured"}

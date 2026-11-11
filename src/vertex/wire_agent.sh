@@ -124,7 +124,14 @@ echo "  WXO_AGENT_MAP — wiring $(echo "${_agent_map}" | python3 -c "import sys
 echo ""
 
 python3 - <<'PYEOF'
-import json, os, sys, subprocess
+import json, os, re, sys, subprocess
+
+def extract_tenant_id(url):
+    if url:
+        m = re.search(r'/instances/([^/?#]+)', url)
+        if m:
+            return m.group(1).strip()
+    return ""
 
 raw = os.environ.get("WXO_AGENT_MAP", "")
 try:
@@ -140,8 +147,8 @@ script_dir    = os.environ.get("SCRIPT_DIR", ".")
 agent_patch   = os.path.join(script_dir, "container_hook")
 
 # Global defaults — every entry falls back to these when it omits tenant/url/key.
-_dflt_tenant  = os.environ.get("WXO_TENANT_ID",       "")
 _dflt_url     = os.environ.get("WXO_OTEL_EXPORT_URL",  "")
+_dflt_tenant  = extract_tenant_id(_dflt_url) or os.environ.get("WXO_TENANT_ID", "")
 _dflt_env     = os.environ.get("ENVIRONMENT_NAME",     "draft")
 _dflt_api_key = os.environ.get("API_KEY",              "")
 _dflt_tok_url = os.environ.get("TOKEN_URL",            "")
@@ -161,11 +168,12 @@ for agent_key, cfg in agent_map.items():
         print(f"  · Skipping '{agent_key}' — no reasoning_engine_id (not a reasoning-engine entry)")
         continue
 
+    export_url = cfg.get("wxo_otel_export_url") or _dflt_url
     env = os.environ.copy()
     env["WXO_AGENT_ID"]        = cfg["wxo_agent_id"]
     # CPD has no tenant; cloud falls back to the global tenant
-    env["WXO_TENANT_ID"]       = "" if os.environ.get("WXO_DEPLOYMENT_MODE") == "cpd" else (cfg.get("wxo_tenant_id") or _dflt_tenant)
-    env["WXO_OTEL_EXPORT_URL"] = cfg.get("wxo_otel_export_url") or _dflt_url
+    env["WXO_TENANT_ID"]       = "" if os.environ.get("WXO_DEPLOYMENT_MODE") == "cpd" else (cfg.get("wxo_tenant_id") or extract_tenant_id(export_url) or _dflt_tenant)
+    env["WXO_OTEL_EXPORT_URL"] = export_url
     env["WXO_AGENT_NAME"]      = cfg.get("wxo_agent_name",  "")
     env["WXO_DISPLAY_NAME"]    = cfg.get("wxo_display_name", "")
     env["ENVIRONMENT_NAME"]    = cfg.get("environment", _dflt_env)

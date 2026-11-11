@@ -122,7 +122,6 @@ _DEPLOYMENT_MODE = "cpd" if os.environ.get("WXO_DEPLOYMENT_MODE", "cloud").strip
 
 _AGENT_ID    = os.environ.get("WXO_AGENT_ID",          "")
 _AGENT_NAME  = os.environ.get("WXO_AGENT_NAME",         "agent" if _PLATFORM != "azure_ai_foundry" else "azure_foundry_agent")
-_TENANT_ID   = (os.environ.get("WXO_TENANT_ID")         or os.environ.get("TENANT_ID",          ""))
 _API_KEY     = (os.environ.get("WXO_API_KEY")            or os.environ.get("API_KEY",            ""))
 _TOKEN_URL   = (os.environ.get("WXO_TOKEN_URL")          or os.environ.get("TOKEN_URL",          ""))
 _EXPORT_URL  = (os.environ.get("WXO_OTEL_EXPORT_URL")   or os.environ.get("OTEL_EXPORT_URL",    ""))
@@ -136,6 +135,15 @@ _CPD_NS      = os.environ.get("CPD_NAMESPACE",   "")
 _CPD_VERIFY  = os.environ.get("CPD_VERIFY_TLS", "false").strip().lower() in ("1", "true", "yes")
 if _DEPLOYMENT_MODE == "cpd" and not _EXPORT_URL and _CPD_HOST and _CPD_NS and _CPD_INST:
     _EXPORT_URL = f"{_CPD_HOST.rstrip('/')}/{_CPD_NS}/instances/{_CPD_INST}/v1/agentops-v3/traces"
+
+def _extract_tenant_id(url: str) -> str:
+    if url:
+        m = re.search(r'/instances/([^/?#]+)', url)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+_TENANT_ID   = _extract_tenant_id(_EXPORT_URL) or (os.environ.get("WXO_TENANT_ID") or os.environ.get("TENANT_ID", "")).strip()
 _ENVIRONMENT = (os.environ.get("WXO_ENVIRONMENT_NAME")
                 or os.environ.get("WXO_ENVIRONMENT")
                 or os.environ.get("ENVIRONMENT_NAME",   "draft"))

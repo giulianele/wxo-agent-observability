@@ -20,7 +20,7 @@ Required env vars
 
 Optional
 ─────────
-  GOOGLE_APPLICATION_CREDENTIALS  path to GCP service-account JSON
+  GOOGLE_APPLICATION_CREDENTIALS  base64-encoded GCP service-account JSON (or path)
   GCP_PROJECT_ID / GCP_REGION     default: env / us-central1
 
 Usage
@@ -51,6 +51,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import ssl
 import sys
 import threading
@@ -60,7 +61,9 @@ from urllib.request import Request, urlopen
 
 
 # ── Deploy-time GCP config ────────────────────────────────────────────────────
-SA_KEY_FILE        = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+SA_KEY_RAW         = (os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
+                      or os.environ.get("GCP_SERVICE_ACCOUNT_BASE64")
+                      or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")).strip()
 GCP_PROJECT        = os.environ.get("GCP_PROJECT_ID", "")
 GCP_REGION         = os.environ.get("GCP_REGION", "us-central1")
 STAGING_BUCKET     = f"gs://{GCP_PROJECT}-agent-staging" if GCP_PROJECT else ""
@@ -77,9 +80,15 @@ REASONING_ENGINE_ID = os.environ.get("REASONING_ENGINE_ID", "")
 # backward compatibility with older config.env files.
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _extract_tenant_id(url: str) -> str:
+    if url:
+        m = re.search(r'/instances/([^/?#]+)', url)
+        if m:
+            return m.group(1).strip()
+    return ""
+
 _AGENT_ID    = os.environ.get("WXO_AGENT_ID",          "")
 _AGENT_NAME  = os.environ.get("WXO_AGENT_NAME",        "vertex_agent")
-_TENANT_ID   = (os.environ.get("WXO_TENANT_ID")        or os.environ.get("TENANT_ID",   ""))
 _API_KEY     = (os.environ.get("WXO_API_KEY")           or os.environ.get("API_KEY",     ""))
 _TOKEN_URL   = (os.environ.get("WXO_TOKEN_URL")         or os.environ.get("TOKEN_URL",   ""))
 _MODE        = "cpd" if os.environ.get("WXO_DEPLOYMENT_MODE", "cloud").strip().lower() == "cpd" else "cloud"
@@ -96,6 +105,8 @@ if _MODE == "cpd":
     _EXPORT_URL = (os.environ.get("CPD_EXPORT_URL") or _EXPORT_URL
                    or (f"{_CPD_HOST}/{_CPD_NS}/instances/{_CPD_IID}/v1/agentops-v3/traces"
                        if _CPD_HOST and _CPD_NS and _CPD_IID else ""))
+else:
+    _TENANT_ID = _extract_tenant_id(_EXPORT_URL) or (os.environ.get("WXO_TENANT_ID") or os.environ.get("TENANT_ID", ""))
 _ENVIRONMENT = (os.environ.get("WXO_ENVIRONMENT_NAME")  or os.environ.get("ENVIRONMENT_NAME", "draft"))
 _GCP_PROJECT = GCP_PROJECT
 _GCP_REGION  = GCP_REGION
@@ -261,7 +272,7 @@ def _do_post(payload: dict, token: str, export_url: str = "", tenant_id: str = "
     from urllib.error import HTTPError as _HE
 
     export_url = export_url or _os.environ.get("WXO_OTEL_EXPORT_URL") or _EXPORT_URL
-    tenant_id  = tenant_id  or _os.environ.get("WXO_TENANT_ID")       or _TENANT_ID
+    tenant_id  = tenant_id  or _extract_tenant_id(export_url) or _os.environ.get("WXO_TENANT_ID") or _TENANT_ID
     agent_id   = agent_id   or _AGENT_ID
 
     data = _j.dumps(payload).encode()
@@ -328,10 +339,10 @@ def _post_trace(
     # Resolve config: instance override → env var → module global
     agent_id    = _agent_id    or _os.environ.get("WXO_AGENT_ID",         "") or _AGENT_ID
     agent_name  = _agent_name  or _os.environ.get("WXO_AGENT_NAME",       "") or _AGENT_NAME
-    tenant_id   = _tenant_id   or _os.environ.get("WXO_TENANT_ID",        "") or _TENANT_ID
+    export_url  = _export_url  or _os.environ.get("WXO_OTEL_EXPORT_URL",   "") or _EXPORT_URL
+    tenant_id   = _tenant_id   or _extract_tenant_id(export_url) or _os.environ.get("WXO_TENANT_ID", "") or _TENANT_ID
     api_key     = _api_key     or _os.environ.get("WXO_API_KEY",           "") or _API_KEY
     token_url   = _token_url   or _os.environ.get("WXO_TOKEN_URL",         "") or _TOKEN_URL
-    export_url  = _export_url  or _os.environ.get("WXO_OTEL_EXPORT_URL",   "") or _EXPORT_URL
     environment = _environment or _os.environ.get("WXO_ENVIRONMENT_NAME",  "") or _ENVIRONMENT
 
     if not export_url:
@@ -721,10 +732,10 @@ class WxoTracingWrapper:
         self._inner = inner_agent
         self._aid  = _os.environ.get("WXO_AGENT_ID", "")
         self._anm  = _os.environ.get("WXO_AGENT_NAME", type(inner_agent).__name__)
-        self._tid  = (_os.environ.get("WXO_TENANT_ID") or _os.environ.get("TENANT_ID", ""))
+        self._eurl = (_os.environ.get("WXO_OTEL_EXPORT_URL") or _os.environ.get("OTEL_EXPORT_URL", ""))
+        self._tid  = _extract_tenant_id(self._eurl) or (_os.environ.get("WXO_TENANT_ID") or _os.environ.get("TENANT_ID", ""))
         self._key  = (_os.environ.get("WXO_API_KEY") or _os.environ.get("API_KEY", ""))
         self._turl = (_os.environ.get("WXO_TOKEN_URL") or _os.environ.get("TOKEN_URL", ""))
-        self._eurl = (_os.environ.get("WXO_OTEL_EXPORT_URL") or _os.environ.get("OTEL_EXPORT_URL", ""))
         self._env  = (_os.environ.get("WXO_ENVIRONMENT_NAME") or _os.environ.get("ENVIRONMENT_NAME", "draft"))
 
     def __getattr__(self, name):
@@ -1041,11 +1052,41 @@ class WxoTracingWrapper:
 # GCP auth (deploy-time only — not cloudpickled)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _load_service_account() -> dict:
+    if not SA_KEY_RAW:
+        raise RuntimeError(
+            "GOOGLE_APPLICATION_CREDENTIALS / GCP_SERVICE_ACCOUNT_JSON is required. "
+            "Provide base64-encoded service account JSON or a local file path."
+        )
+    if os.path.isfile(SA_KEY_RAW):
+        with open(SA_KEY_RAW, "r", encoding="utf-8") as f:
+            return json.load(f)
+    if SA_KEY_RAW.startswith("{"):
+        return json.loads(SA_KEY_RAW)
+    try:
+        decoded = base64.b64decode(SA_KEY_RAW).decode("utf-8").strip()
+        if decoded.startswith("{"):
+            return json.loads(decoded)
+    except Exception:
+        pass
+    cleaned = SA_KEY_RAW
+    if '""' in cleaned:
+        cleaned = cleaned.replace('""', '"')
+    if cleaned.startswith('"') and cleaned.endswith('"'):
+        cleaned = cleaned[1:-1]
+    if cleaned.startswith("{"):
+        return json.loads(cleaned)
+    raise ValueError(
+        "Could not parse GCP service account JSON from GOOGLE_APPLICATION_CREDENTIALS. "
+        "Ensure it is a valid base64-encoded JSON string, raw JSON, or a file path."
+    )
+
+
 def _gcp_token() -> str:
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding as _pad
 
-    sa  = json.load(open(SA_KEY_FILE))
+    sa  = _load_service_account()
     now = int(time.time())
 
     def _b64(d):
@@ -1359,15 +1400,15 @@ def main() -> None:
         if not _CPD_NS:         missing.append("CPD_NAMESPACE")
     else:
         if not _EXPORT_URL:     missing.append("WXO_OTEL_EXPORT_URL")
-        if not _TENANT_ID:      missing.append("WXO_TENANT_ID")
+        if not _TENANT_ID and not _extract_tenant_id(_EXPORT_URL): missing.append("WXO_TENANT_ID")
         if not _API_KEY:        missing.append("WXO_API_KEY")
         if not _TOKEN_URL:      missing.append("WXO_TOKEN_URL")
     if missing:
         print("Missing required env vars: " + ", ".join(missing))
         sys.exit(1)
 
-    if not SA_KEY_FILE:
-        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS is required by this script")
+    if not SA_KEY_RAW:
+        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS is required by this script (base64-encoded JSON or path)")
 
     _gcp_token()
     print("GCP credentials valid")

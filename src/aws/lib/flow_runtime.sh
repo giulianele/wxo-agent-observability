@@ -121,6 +121,16 @@ print(u.split('/', 1)[-1].rsplit(':', 1)[0])")
     # cloud: WXO_API_KEY prefers the per-agent map entry; falls back to API_KEY.
     # cpd:   CPD_* login values are injected instead (no API key / tenant).
     local _RT_ENV
+    if [ "${WXO_DEPLOYMENT_MODE:-cloud}" != "cpd" ]; then
+        if [ -z "${WXO_TENANT_ID:-}" ] && [ -n "${WXO_OTEL_EXPORT_URL:-}" ]; then
+            if [[ "${WXO_OTEL_EXPORT_URL}" =~ /instances/([^/]+) ]]; then
+                WXO_TENANT_ID="${BASH_REMATCH[1]}"
+                WXO_TENANT_ID="${WXO_TENANT_ID%%\?*}"
+                WXO_TENANT_ID="${WXO_TENANT_ID%%\#*}"
+            fi
+        fi
+    fi
+
     if [ "${WXO_DEPLOYMENT_MODE:-cloud}" = "cpd" ]; then
         _RT_ENV="$(python3 -c "
 import json, os

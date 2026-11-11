@@ -86,6 +86,18 @@ wxo_resolve_mode() {
             export WXO_OTEL_EXPORT_URL=""
         fi
     fi
+
+    # Derive WXO_TENANT_ID from WXO_OTEL_EXPORT_URL if not explicitly set
+    if [ "${_mode}" != "cpd" ]; then
+        if wxo_is_unset "${WXO_TENANT_ID:-}" && ! wxo_is_unset "${WXO_OTEL_EXPORT_URL:-}"; then
+            if [[ "${WXO_OTEL_EXPORT_URL}" =~ /instances/([^/]+) ]]; then
+                local _tid="${BASH_REMATCH[1]}"
+                _tid="${_tid%%\?*}"
+                _tid="${_tid%%\#*}"
+                export WXO_TENANT_ID="${_tid}"
+            fi
+        fi
+    fi
 }
 
 # wxo_validate_mode <config-description>
@@ -95,7 +107,7 @@ wxo_validate_mode() {
     if [ "${WXO_DEPLOYMENT_MODE:-cloud}" = "cpd" ]; then
         _required="CPD_HOST_URL CPD_USERNAME CPD_PASSWORD CPD_INSTANCE_ID CPD_NAMESPACE ENVIRONMENT_NAME"
     else
-        _required="API_KEY TOKEN_URL WXO_TENANT_ID WXO_OTEL_EXPORT_URL ENVIRONMENT_NAME"
+        _required="API_KEY TOKEN_URL WXO_OTEL_EXPORT_URL ENVIRONMENT_NAME"
     fi
     for _var in ${_required}; do
         if wxo_is_unset "${!_var:-}"; then

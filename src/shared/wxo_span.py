@@ -91,6 +91,16 @@ def resolve_export_url() -> str:
                                 os.environ.get("CPD_INSTANCE_ID", ""))
 
 
+def extract_tenant_id(export_url: str = "") -> str:
+    """Extract tenant/instance ID from an OTEL export URL or environment."""
+    url = export_url or os.environ.get("WXO_OTEL_EXPORT_URL") or os.environ.get("OTEL_EXPORT_URL", "")
+    if url:
+        m = re.search(r'/instances/([^/?#]+)', url)
+        if m:
+            return m.group(1).strip()
+    return (os.environ.get("WXO_TENANT_ID") or os.environ.get("TENANT_ID", "")).strip()
+
+
 # ---------------------------------------------------------------------------
 # Token counting — stdlib cl100k_base approximation (no tiktoken dependency)
 # ---------------------------------------------------------------------------

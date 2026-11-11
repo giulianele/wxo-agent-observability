@@ -2,33 +2,38 @@
 """
 forwarder/deploy.py
 ===================
-Deploy the OTLP Forwarder to ONE target and keep its WXO config in sync.
+Deploy the OTLP Forwarder for Claude to ONE target and connect Claude to it.
 
-  deploy(target)  create/update the forwarder, then push config   (--deploy)
-  sync(target)    push config only, no code redeploy             (--sync)
+  deploy(target)  create/update the forwarder, push config, read back its URL, then
+                  point Claude's OTel destination at that URL            (default)
+  sync(target)    push config only, no code redeploy                     (--sync)
 
-Targets (FORWARDER_TARGET in config/forwarder.env, or --target):
+Targets (FORWARDER_TARGET in config/claude.env, or --target; asked interactively if unset):
   aws     Lambda + Function URL. Config lives in SSM, picked up within ~60 s.
   azure   Function App. Config lives in App Settings (the app restarts).
   docker  Local container. Config is passed as env (container is recreated).
 
 Inputs:
-  config/shared.env     API_KEY, TOKEN_URL
-  config/forwarder.env  WXO_TENANT_ID, WXO_OTEL_EXPORT_URL, ENVIRONMENT_NAME, WXO_AGENT_MAP, FORWARDER_TARGET + settings
+  config/shared.env   API_KEY, TOKEN_URL
+  config/claude.env   WXO_TENANT_ID, WXO_OTEL_EXPORT_URL, ENVIRONMENT_NAME, WXO_AGENT_MAP, FORWARDER_TARGET + settings
 
-  register-anthropic    Register the deployed forwarder as an Anthropic (Claude) OTel destination.
-                        Run it separately later, or add --register-anthropic to deploy/sync.
-  unregister-anthropic  Delete that destination. Both only touch Anthropic, never the forwarder.
-    Needs ANTHROPIC_ADMIN_API_KEY (export in shell) and ANTHROPIC_WORKSPACE_ID (ids or 'all').
+Claude step (after deploy):
+  ANTHROPIC_ADMIN_API_KEY set  -> the destination is created/updated in Anthropic automatically
+                                  (also needs ANTHROPIC_WORKSPACE_ID: ids or 'all').
+  ANTHROPIC_ADMIN_API_KEY unset -> nothing is sent; the forwarder endpoint is printed so you can
+                                  set it in your Claude OTel settings yourself.
 
-Normally invoked through:  ./wire_agent.sh --forwarder --deploy | --sync [--target T] [--dry-run]
-                           ./wire_agent.sh --forwarder --register-anthropic [--target T] [--dry-run]
+  register-anthropic    Only do the Claude step against an already deployed forwarder.
+  unregister-anthropic  Delete the Anthropic destination. Never touches the forwarder.
+
+Normally invoked through:  ./claude.sh [--sync] [--target T] [--dry-run]
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -39,10 +44,10 @@ from typing import Any
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(os.path.dirname(os.path.dirname(HERE)), "config")
-FORWARDER_ENV = os.path.join(CONFIG_DIR, "forwarder.env")
+CLAUDE_ENV = os.path.join(CONFIG_DIR, "claude.env")
 DEFAULT_TOKEN_URL = "https://account-iam.platform.saas.ibm.com/api/2.0/apikeys/token"
 # Default Lambda name when AWS_LAMBDA_FUNCTION_NAME is unset (the IAM role is "<name>-role").
-DEFAULT_LAMBDA_NAME = "wxo-agent-analytics-otlp-forwarder"
+DEFAULT_LAMBDA_NAME = "wxo-otlp-forwarder-claude"
 TARGETS = ("aws", "azure", "docker")
 CODE_FILES = ("forwarder.py", "lambda_function.py", "function_app.py", "host.json", "requirements.txt")
 
@@ -53,7 +58,7 @@ class DeployError(Exception):
 
 # ── Config ───────────────────────────────────────────────────────────────────
 def load_env() -> dict:
-    """Source config.env or config/{shared,forwarder}.env with bash and return the resulting environment.
+    """Source config.env or config/{shared,claude}.env with bash and return the resulting environment.
 
     bash (not a regex parser) so ${VAR} references, quotes and multi-line JSON behave
     exactly as they do when the files are sourced by wire_agent.sh. Values already in
@@ -67,21 +72,21 @@ def load_env() -> dict:
     ]
     unified = next((c for c in unified_candidates if os.path.exists(c)), None)
 
-    # Layers, lowest → highest: config.env [forwarder] < config/shared.env < config/forwarder.env.
-    # Platform-specific files (config/forwarder.env) take highest precedence.
+    # Layers, lowest → highest: config.env [claude] < config/shared.env < config/claude.env.
+    # Platform-specific files (config/claude.env) take highest precedence.
     merged: dict = {}
     if unified:
         sys.path.insert(0, os.path.join(repo_root, "src", "lib"))
         try:
             from parse_env_section import parse_config
-            section = parse_config(unified, "forwarder")
+            section = parse_config(unified, "claude")
             for k, v in section.items():
                 if not _placeholder(v):
                     merged[k] = v
         except Exception as exc:
             raise DeployError(f"Could not parse {unified}: {exc}")
 
-    files = [os.path.join(CONFIG_DIR, n) for n in ("shared.env", "forwarder.env")]
+    files = [os.path.join(CONFIG_DIR, n) for n in ("shared.env", "claude.env")]
     files = [f for f in files if os.path.exists(f)]
     if files:
         script = "set -a\n" + "".join(f'source "{f}"\n' for f in files) + \
@@ -95,6 +100,9 @@ def load_env() -> dict:
             if not _placeholder(v) or _placeholder(merged.get(k, "")):
                 merged[k] = v
     # Process env wins over files (lets callers override one value for a single run).
+    # With no config files at all (e.g. the integration-test harness) the process env is the only source.
+    if not unified and not files:
+        return {**merged, **{k: v for k, v in os.environ.items() if v != ""}}
     return {**merged, **{k: v for k, v in os.environ.items() if k in merged and v != ""}}
 
 
@@ -109,6 +117,15 @@ def wxo_mode(env: dict) -> str:
     return "cpd" if (env.get("WXO_DEPLOYMENT_MODE") or "cloud").strip().lower() == "cpd" else "cloud"
 
 
+def extract_tenant_id(export_url: str) -> str:
+    """Extract tenant/instance ID from an OTEL export URL."""
+    if export_url:
+        m = re.search(r'/instances/([^/?#]+)', export_url)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
 def cpd_export_url(env: dict) -> str:
     """Explicit URL wins; otherwise build the CPD agentops traces URL from CPD_*."""
     explicit = env.get("CPD_EXPORT_URL") or env.get("WXO_OTEL_EXPORT_URL") or ""
@@ -121,10 +138,16 @@ def cpd_export_url(env: dict) -> str:
 def validate(env: dict) -> dict:
     """Check WXO settings; return the parsed agent map."""
     errors = []
-    required = CPD_VARS if wxo_mode(env) == "cpd" else ("API_KEY", "WXO_TENANT_ID", "WXO_OTEL_EXPORT_URL")
+    required = CPD_VARS if wxo_mode(env) == "cpd" else ("API_KEY", "WXO_OTEL_EXPORT_URL")
     for var in required:
         if _placeholder(env.get(var, "")):
             errors.append(f"{var} is not set in config.env or config files (WXO_DEPLOYMENT_MODE={wxo_mode(env)})")
+    if wxo_mode(env) != "cpd":
+        url = env.get("WXO_OTEL_EXPORT_URL", "")
+        tid = env.get("WXO_TENANT_ID", "") or extract_tenant_id(url)
+        if _placeholder(tid):
+            errors.append("Tenant ID could not be extracted from WXO_OTEL_EXPORT_URL (expected '.../instances/<id>/...'). "
+                          "Fix the URL, or set WXO_TENANT_ID explicitly.")
     try:
         raw_map = env.get("UNIVERSAL_AGENT_MAP") or env.get("WXO_AGENT_MAP", "") or "{}"
         agent_map = json.loads(raw_map)
@@ -152,12 +175,13 @@ def settings_from(env: dict) -> dict:
             **{k.lower(): env[k] for k in CPD_VARS},
             "cpd_verify_tls": env.get("CPD_VERIFY_TLS") or "false",
         }
+    tenant_id = env.get("WXO_TENANT_ID", "") or extract_tenant_id(env.get("WXO_OTEL_EXPORT_URL", ""))
     return {
         "deployment_mode": "cloud",
-        "tenant_id": env["WXO_TENANT_ID"],
-        "otel_export_url": env["WXO_OTEL_EXPORT_URL"],
+        "tenant_id": tenant_id,
+        "otel_export_url": env.get("WXO_OTEL_EXPORT_URL", ""),
         "environment": env.get("ENVIRONMENT_NAME") or "draft",
-        "api_key": env["API_KEY"],
+        "api_key": env.get("API_KEY", ""),
         "token_url": env.get("TOKEN_URL") or DEFAULT_TOKEN_URL,
     }
 
@@ -236,9 +260,15 @@ def aws_sync(env: dict, agent_map: dict, dry_run: bool) -> None:
     _agents(agent_map)
 
 
+def lambda_name(env: dict) -> str:
+    """Lambda function name: AWS_LAMBDA_FUNCTION_NAME if set, else the built-in default."""
+    name = (env.get("AWS_LAMBDA_FUNCTION_NAME") or "").strip()
+    return DEFAULT_LAMBDA_NAME if _placeholder(name) else name
+
+
 def aws_deploy(env: dict, agent_map: dict, dry_run: bool) -> str:
     ctl = _aws_ctl()
-    name = env.get("AWS_LAMBDA_FUNCTION_NAME") or DEFAULT_LAMBDA_NAME
+    name = lambda_name(env)
     region = env.get("AWS_REGION", "us-east-1")
     ctl.SETTINGS_PARAM = env.get("SSM_SETTINGS_PATH", "/wxo-agent/settings")
     ctl.AGENT_MAP_PARAM = env.get("SSM_AGENT_MAP_PATH", "/wxo-agent/agent_map")
@@ -312,7 +342,7 @@ def azure_deploy(env: dict, agent_map: dict, dry_run: bool) -> str:
     if not _az_exists(app, rg):
         if not location or not storage:
             raise DeployError(f"Function App '{app}' does not exist. To create it set AZURE_LOCATION and "
-                              f"AZURE_STORAGE_ACCOUNT in config/forwarder.env.")
+                              f"AZURE_STORAGE_ACCOUNT in config/claude.env.")
         print("  Creating missing resources (resource group / storage account / Function App) ...")
         # Reuse an existing group/storage account: they may live in another region than the
         # Function App, and `create` with a different location fails.
@@ -400,24 +430,46 @@ _DEPLOY = {"aws": aws_deploy, "azure": azure_deploy, "docker": docker_deploy}
 _HEALTH = {"aws": "/health", "azure": "/health", "docker": "/health"}
 
 
-def run(action: str, target: str | None = None, dry_run: bool = False) -> int:
-    """action: 'deploy' or 'sync'. Returns a process exit code."""
+def _choose_target() -> str:
+    """Ask where to deploy; only used when no target is configured and a terminal is attached."""
+    print("\n  Where should the forwarder be deployed?")
+    print("    1) aws     AWS Lambda + Function URL")
+    print("    2) azure   Azure Function App")
+    print("    3) docker  Local Docker container")
+    choice = input("  Enter choice [1-3]: ").strip().lower()
+    return {"1": "aws", "2": "azure", "3": "docker"}.get(choice, choice)
+
+
+def run(action: str, target: str | None = None, dry_run: bool = False,
+        claude: bool = False, content_mode: str | None = None) -> int:
+    """action: 'deploy' or 'sync'. With claude=True a successful deploy is followed by the Claude step.
+
+    Returns a process exit code.
+    """
     try:
         env = load_env()
         target = (target or env.get("FORWARDER_TARGET", "")).strip().lower()
+        if not target and sys.stdin.isatty():
+            target = _choose_target()
         if target not in TARGETS:
             raise DeployError(f"FORWARDER_TARGET must be one of {', '.join(TARGETS)} "
-                              f"(set it in config/forwarder.env or pass --target). Got: {target or '(empty)'}")
+                              f"(set it in config/claude.env or pass --target). Got: {target or '(empty)'}")
         agent_map = validate(env)
 
         print(f"\n  {action.upper()} → {target}{'  [dry-run]' if dry_run else ''}")
         if wxo_mode(env) == "cpd":
             print(f"  WXO mode     : cpd ({env['CPD_HOST_URL']}, instance {env['CPD_INSTANCE_ID']})")
         else:
-            print(f"  WXO tenant   : {env['WXO_TENANT_ID']}")
+            tenant_disp = env.get("WXO_TENANT_ID", "") or extract_tenant_id(env.get("WXO_OTEL_EXPORT_URL", ""))
+            print(f"  WXO tenant   : {tenant_disp}")
         print(f"  Environment  : {env.get('ENVIRONMENT_NAME') or 'draft'}")
         print(f"  Agents       : {len(agent_map)}")
         print(f"  Caller auth  : {'ON (FORWARDER_AUTH_TOKEN)' if env.get('FORWARDER_AUTH_TOKEN') else 'off (optional)'}")
+        if target == "aws":
+            # Set automatically (config value, else default) so every helper in this run sees the same name.
+            src = "default" if _placeholder((env.get("AWS_LAMBDA_FUNCTION_NAME") or "").strip()) else "from config"
+            os.environ["AWS_LAMBDA_FUNCTION_NAME"] = env["AWS_LAMBDA_FUNCTION_NAME"] = lambda_name(env)
+            print(f"  Lambda name  : {env['AWS_LAMBDA_FUNCTION_NAME']}  ({src})")
         # Apply the target's own env (region, profile, keys) to the CLIs we shell out to.
         for k in ("AWS_REGION", "AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DEFAULT_REGION"):
             if env.get(k):
@@ -425,21 +477,50 @@ def run(action: str, target: str | None = None, dry_run: bool = False) -> int:
         os.environ.setdefault("AWS_DEFAULT_REGION", env.get("AWS_REGION", "us-east-1"))
         print()
 
+        url = ""
         if action == "deploy":
             url = _DEPLOY[target](env, agent_map, dry_run)
             if url and not dry_run:
                 ok = _health(url + _HEALTH[target])
                 print(f"\n  Forwarder endpoint : {url}")
                 print(f"  Health check       : {'ok' if ok else 'no answer yet (cold start? retry in a minute)'}")
-                print("  Point your agent at it:")
-                print(f'    export OTEL_EXPORTER_OTLP_ENDPOINT="{url}"')
         else:
             _SYNC[target](env, agent_map, dry_run)
         print("\n  ✓ Done." if not dry_run else "\n  ✓ Dry-run complete (nothing changed).")
+        if action == "deploy" and claude:
+            return _connect_claude(env, target, url, dry_run, content_mode)
         return 0
     except DeployError as exc:
         print(f"\n{exc}", file=sys.stderr)
         return 1
+
+
+def _connect_claude(env: dict, target: str, url: str, dry_run: bool, content_mode: str | None) -> int:
+    """Point Claude's OTel destination at the freshly deployed forwarder.
+
+    With an Anthropic admin key the destination is created/updated automatically; without one
+    (or for a non-public URL) the endpoint is printed for the user to set in their Claude OTel settings.
+    """
+    key = _cfg(env, "ANTHROPIC_ADMIN_API_KEY")
+    has_key = bool(key) and not _placeholder(key)
+    token = _cfg(env, "FORWARDER_AUTH_TOKEN")
+    if has_key and (dry_run or url.startswith("https://")):
+        return anthropic_destination("register", target, dry_run, content_mode,
+                                     url=url or "(known after deploy)")
+
+    print("\n  ── Claude (Anthropic) OTel setup " + "─" * 30)
+    if has_key:
+        print(f"  ANTHROPIC_ADMIN_API_KEY is set, but {url or 'the forwarder'} is not a public https:// URL,")
+        print("  which Anthropic requires. Not updating Anthropic.")
+    else:
+        print("  ANTHROPIC_ADMIN_API_KEY is not set, so Claude was not updated automatically.")
+    print("  Set this endpoint in your Claude OTel (OpenTelemetry) settings:")
+    print(f"    Endpoint : {url or '(deploy first to get the forwarder URL)'}")
+    print("    Protocol : http/protobuf  (http/json also works)")
+    if token:
+        print(f"    Header   : Authorization: Bearer {token}")
+    print("  To have this script do it next time, set ANTHROPIC_ADMIN_API_KEY and ANTHROPIC_WORKSPACE_ID.")
+    return 0
 
 
 # ── Anthropic (Claude) telemetry destination ─────────────────────────────────
@@ -460,7 +541,7 @@ def _forwarder_url(env: dict, target: str) -> str:
     url = _cfg(env, "FORWARDER_URL")
     if not url:
         if target == "aws":
-            name = env.get("AWS_LAMBDA_FUNCTION_NAME") or DEFAULT_LAMBDA_NAME
+            name = lambda_name(env)
             out = _aws_ctl().aws(["lambda", "get-function-url-config", "--function-name", name],
                                  env.get("AWS_REGION", "us-east-1"), check=False)
             url = json.loads(out)["FunctionUrl"] if out else ""
@@ -474,13 +555,16 @@ def _forwarder_url(env: dict, target: str) -> str:
         url = url[: -len("/v1/traces")]
     if not url.startswith("https://"):
         raise DeployError("Anthropic needs a public https:// forwarder URL (not localhost/IP).\n"
-                          "  Set FORWARDER_URL, or use --target aws|azure after --deploy.")
+                          "  Set FORWARDER_URL, or use --target aws|azure.")
     return url
 
 
 def anthropic_destination(action: str, target: str | None = None, dry_run: bool = False,
-                          content_mode: str | None = None) -> int:
-    """action: 'register' (create or update) or 'unregister' (delete)."""
+                          content_mode: str | None = None, url: str | None = None) -> int:
+    """action: 'register' (create or update) or 'unregister' (delete).
+
+    url: forwarder base URL when the caller just deployed it; otherwise it is looked up from the target.
+    """
     try:
         env = load_env()
         target = (target or env.get("FORWARDER_TARGET", "")).strip().lower()
@@ -498,7 +582,10 @@ def anthropic_destination(action: str, target: str | None = None, dry_run: bool 
         workspaces = ({"type": "all"} if ws_raw.lower() == "all"
                       else {"type": "include", "workspace_ids": [w.strip() for w in ws_raw.split(",") if w.strip()]})
         token = _cfg(env, "FORWARDER_AUTH_TOKEN")
-        url = _forwarder_url(env, target) if action == "register" else ""
+        if action != "register":
+            url = ""
+        elif url is None:
+            url = _forwarder_url(env, target)
 
         # Content mode: 'content' (full payload) or 'metadata_only'
         cm_raw = (content_mode or _cfg(env, "ANTHROPIC_CONTENT_MODE") or "content").lower().strip()
@@ -518,10 +605,24 @@ def anthropic_destination(action: str, target: str | None = None, dry_run: bool 
         if not key or _placeholder(key):
             raise DeployError("ANTHROPIC_ADMIN_API_KEY is not set. Export it in your shell rather than a file:\n"
                               "    export ANTHROPIC_ADMIN_API_KEY=sk-ant-admin...")
+        # Private dependency dir: avoids PEP 668 "externally-managed-environment"
+        # errors and never touches the system/Homebrew Python.
+        deps_dir = os.path.join(os.path.expanduser("~"), ".cache", "wxo-external-agent-tracing", "pydeps")
+        if deps_dir not in sys.path:
+            sys.path.insert(0, deps_dir)
         try:
             from anthropic import Anthropic
         except ImportError:
-            raise DeployError("The 'anthropic' package is required: pip install -U anthropic")
+            print(f"  Installing the 'anthropic' package into {deps_dir} ...")
+            res = subprocess.run([sys.executable, "-m", "pip", "install", "-U", "--target", deps_dir, "anthropic"],
+                                 capture_output=True, text=True)
+            if res.returncode != 0:
+                raise DeployError("Could not install the 'anthropic' package. Install it manually:\n"
+                                  "    python3 -m venv .venv && . .venv/bin/activate && pip install -U anthropic\n"
+                                  + (res.stderr or res.stdout).strip())
+            import importlib
+            importlib.invalidate_caches()
+            from anthropic import Anthropic
         dests = Anthropic(api_key=key).beta.organization.telemetry_destinations
         existing = next((d for d in dests.list(limit=100) if d.display_name == dest_name), None)
 
@@ -566,14 +667,12 @@ if __name__ == "__main__":
     p.add_argument("action", choices=["deploy", "sync", "register-anthropic", "unregister-anthropic"])
     p.add_argument("--target", choices=TARGETS)
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--register-anthropic", "--claude", "--anthropic", dest="register_anthropic", action="store_true",
-                   help="with deploy/sync: also register/update the forwarder in Claude (Anthropic) telemetry")
+    p.add_argument("--claude", action="store_true",
+                   help="with deploy: after deploying, connect Claude (auto-register if ANTHROPIC_ADMIN_API_KEY is set, "
+                        "otherwise print the endpoint to set in Claude's OTel settings)")
     p.add_argument("--content-mode", choices=["content", "metadata_only", "full"],
                    help="Claude trace content mode: 'content' (full prompt/completions) or 'metadata_only'")
     a = p.parse_args()
     if a.action.endswith("-anthropic"):
         sys.exit(anthropic_destination(a.action.split("-")[0], a.target, a.dry_run, a.content_mode))
-    rc = run(a.action, a.target, a.dry_run)
-    if rc == 0 and a.register_anthropic:
-        rc = anthropic_destination("register", a.target, a.dry_run, a.content_mode)
-    sys.exit(rc)
+    sys.exit(run(a.action, a.target, a.dry_run, a.claude, a.content_mode))

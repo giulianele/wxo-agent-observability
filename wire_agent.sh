@@ -6,16 +6,18 @@
 #
 # Usage:
 #   ./wire_agent.sh --aws         [--harness|--runtime]              [--dry-run]
-#   ./wire_agent.sh --azure       [--prompt|--hosted] [--revert]     [--dry-run] [--publish-only]
 #   ./wire_agent.sh --vertex      [--reasoning-engine|--selfhosted]  [--dry-run]
 #   ./wire_agent.sh --salesforce  [--apex|--session <id>|--poller]   [--dry-run]
-#   ./wire_agent.sh --forwarder   [--deploy [--claude]]              [--dry-run]
+#
+# Azure and Claude have their own entrypoints (thin wrappers over this script):
+#   ./azure.sh                    [--publish-only]                   [--dry-run]
+#   ./claude.sh                   [--target aws|azure|docker]        [--dry-run]
 #
 # Agent input (ALL platforms):
 #   WXO_AGENT_MAP in config/<platform>.env — the only supported input.
 #   One entry = one agent.  Many entries = wire all in one run.
 #   Each entry carries the AGENT_REF (or agent key) → WXO identity mapping.
-#   See config/aws.env, config/azure.env, config/vertex.env, config/salesforce.env, config/forwarder.env
+#   See config/aws.env, config/azure.env, config/vertex.env, config/salesforce.env, config/claude.env
 #   for the per-platform JSON schema.
 #
 # AWS flows (AGENT_TYPE in config/aws.env):
@@ -23,17 +25,20 @@
 #   --runtime  → Flow B: sitecustomize.py image patch
 #
 # Azure flows:
-#   --prompt   → Flow A: Azure Function App polls Log Analytics every 30s
-#   --hosted   → Flow B: sitecustomize.py bundled into agent version (default)
+#   Azure Function App polls Log Analytics every 5s (covers prompt & hosted agents)
 #
 # Vertex flows:
 #   --selfhosted       → sitecustomize.py injected into container (default)
 #   --reasoning-engine → WXO tracing embedded in Reasoning Engine query()
 #
-# Forwarder flows (FORWARDER_TARGET in config.env: aws | azure | docker):
-#   (no flag)           → Run local OTLP receiver daemon (port 4318)
-#   --deploy            → Create / update forwarder on target (AWS Lambda / Azure / Docker)
-#   --deploy --claude   → Deploy forwarder and configure Claude (Anthropic) telemetry destination
+# Claude flow (FORWARDER_TARGET in config/claude.env, or --target; asked if unset):
+#   (no flag)           → Deploy the forwarder on aws | azure | docker, read back its URL, then
+#                         ANTHROPIC_ADMIN_API_KEY set   → point Claude's OTel destination at that URL
+#                         ANTHROPIC_ADMIN_API_KEY unset → print the URL to set in Claude's OTel settings
+#   --sync              → Push config (WXO_AGENT_MAP, ...) to the deployed forwarder, no code redeploy
+#   --local             → Run the OTLP receiver locally instead of deploying (port 4318)
+#   --metadata-only | --full-content   → Claude trace content mode
+#   --unregister-anthropic             → Remove the Claude OTel destination
 #
 # Salesforce flows:
 #   --apex        → In-org forwarder (default): deploys WxoSessionPoller Queueable stack +
@@ -45,7 +50,7 @@
 #
 # Pre-requisites:
 #   AWS:        AWS CLI authenticated; Docker (--runtime only); ssm_params.sh run once (aws/ssm_params.sh)
-#   Azure:      az CLI authenticated; func CLI (--prompt); azure-ai-projects (--hosted)
+#   Azure:      az CLI authenticated; func CLI
 #   Vertex:     gcloud authenticated; Docker (--selfhosted)
 #   Salesforce: Connected App with API access; SF_USERNAME/PASSWORD/CLIENT_ID set
 # =============================================================================
@@ -66,14 +71,12 @@ PASSTHROUGH_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --aws)         PLATFORM="aws" ;;
-        --azure)       PLATFORM="azure" ;;
         --vertex)      PLATFORM="vertex" ;;
         --salesforce)  PLATFORM="salesforce" ;;
-        --forwarder|--otlp) PLATFORM="forwarder" ;;
         --platform)    shift; PLATFORM="${1:-}" ;;
         --platform=*)  PLATFORM="${1#--platform=}" ;;
         --status|--list) SHOW_STATUS=1 ;;
-        --show)        shift; SHOW_SECTION="${1:-forwarder}" ;;
+        --show)        shift; SHOW_SECTION="${1:-claude}" ;;
         --show=*)      SHOW_SECTION="${1#--show=}" ;;
         --dry-run) DRY_RUN=1; PASSTHROUGH_ARGS+=("--dry-run") ;;
         --help|-h)
@@ -126,7 +129,7 @@ if [ -n "${_unified_cfg}" ]; then
             echo ""
             echo "  Select a platform section from config.env to run:"
             echo ""
-            echo "    1) [forwarder]   OTLP Trace Forwarder (Local / Docker / Lambda / Azure)"
+            echo "    1) [claude]      Claude (OTLP forwarder: Docker / Lambda / Azure)"
             echo "    2) [aws]         AWS AgentCore / Bedrock Agents"
             echo "    3) [azure]       Azure AI Foundry Agents"
             echo "    4) [vertex]      Google Cloud Vertex AI / Reasoning Engine"
@@ -136,7 +139,7 @@ if [ -n "${_unified_cfg}" ]; then
             echo ""
             read -r -p "  Enter choice [1-5]: " _choice
             case "${_choice}" in
-                1) PLATFORM="forwarder" ;;
+                1) PLATFORM="claude" ;;
                 2) PLATFORM="aws" ;;
                 3) PLATFORM="azure" ;;
                 4) PLATFORM="vertex" ;;
@@ -148,9 +151,9 @@ if [ -n "${_unified_cfg}" ]; then
         else
             echo "  ✗ Platform not specified."
             echo "    Specify the platform to run:"
-            echo "      ./wire_agent.sh --forwarder"
+            echo "      ./claude.sh"
+            echo "      ./azure.sh"
             echo "      ./wire_agent.sh --aws"
-            echo "      ./wire_agent.sh --azure"
             echo "      ./wire_agent.sh --vertex"
             echo "      ./wire_agent.sh --salesforce"
             echo "      ./wire_agent.sh --status"
@@ -163,7 +166,7 @@ if [ -n "${_unified_cfg}" ]; then
     # Layered config, lowest → highest precedence:
     #   config/shared.env  <  config/<platform>.env  <  config.env [<platform>]
     # A higher layer only wins when its value is real (not empty / "<placeholder>"),
-    # so credentials may live in forwarder.env or shared.env instead of config.env.
+    # so credentials may live in claude.env or shared.env instead of config.env.
     _cfg_desc="${_unified_cfg} [${PLATFORM}]"
     eval "$(python3 "${SRC_DIR}/lib/parse_env_section.py" "${_unified_cfg}" "${PLATFORM}" "sh")"
     set -a
@@ -178,7 +181,7 @@ if [ -n "${_unified_cfg}" ]; then
     set +a
 else
     if [ -z "${PLATFORM}" ]; then
-        echo "  ✗ Platform not specified. Use --aws, --azure, --vertex, --salesforce, or --forwarder."
+        echo "  ✗ Platform not specified. Use --aws, --vertex, --salesforce, ./azure.sh, or ./claude.sh."
         echo "    Or create a unified config.env (cp config.env.example config.env)."
         echo ""
         echo "  Run $0 --help for usage."
@@ -259,16 +262,16 @@ case "${PLATFORM}" in
     salesforce)
         exec python3 "${SRC_DIR}/salesforce/wire_agent.py" "${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}"
         ;;
-    forwarder)
-        # --deploy / --sync / --target are handled by deploy.py (create infra + push config).
-        _action=""; _target=""; _reg=0; _cm=""; _rest=()
+    claude)
+        # Default action = deploy the forwarder, then connect Claude to its URL (deploy.py).
+        # --sync / --unregister-anthropic / --local select a different action.
+        _action="deploy"; _target=""; _local=0; _cm=""; _rest=()
         _args=("${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}")
         _i=0
         while [ "${_i}" -lt "${#_args[@]}" ]; do
             case "${_args[${_i}]}" in
-                --deploy) _action="deploy" ;;
                 --sync)   _action="sync" ;;
-                --claude|--anthropic|--register-anthropic) _reg=1 ;;
+                --local)  _local=1 ;;
                 --unregister-anthropic) _action="unregister-anthropic" ;;
                 --content-mode) _i=$((_i + 1)); _cm="${_args[${_i}]:-}" ;;
                 --content-mode=*) _cm="${_args[${_i}]#--content-mode=}" ;;
@@ -280,20 +283,16 @@ case "${PLATFORM}" in
             esac
             _i=$((_i + 1))
         done
-        # --register-anthropic alone = register only; combined with --deploy/--sync = do both.
-        _reg_flag=()
-        if [ "${_reg}" -eq 1 ]; then
-            if [ -z "${_action}" ]; then _action="register-anthropic"; else _reg_flag=("--register-anthropic"); fi
-        fi
-        if [ -n "${_action}" ]; then
-            _dx=("${_reg_flag[@]+"${_reg_flag[@]}"}")
+        if [ "${_local}" -eq 0 ]; then
+            _dx=()
+            [ "${_action}" = "deploy" ] && _dx+=("--claude")
             [ "${DRY_RUN}" -eq 1 ] && _dx+=("--dry-run")
             [ -n "${_target}" ] && _dx+=("--target" "${_target}")
             [ -n "${_cm}" ] && _dx+=("--content-mode" "${_cm}")
             exec python3 "${SRC_DIR}/forwarder/deploy.py" "${_action}" "${_dx[@]+"${_dx[@]}"}"
         fi
         if [ -n "${_target}" ]; then
-            echo "  ✗ --target only applies with --deploy or --sync."
+            echo "  ✗ --target does not apply with --local."
             exit 1
         fi
 
@@ -324,6 +323,6 @@ except Exception as e:
 "
         fi
         echo ""
-        exec python3 "${SRC_DIR}/forwarder/wire_agent.py" "${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}"
+        exec python3 "${SRC_DIR}/forwarder/wire_agent.py" "${_rest[@]+"${_rest[@]}"}"
         ;;
 esac

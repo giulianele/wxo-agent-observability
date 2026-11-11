@@ -127,7 +127,14 @@ echo ""
 
 # Parse the map and iterate; Python handles per-agent env overrides
 python3 - <<'PYEOF'
-import json, os, sys, subprocess
+import json, os, re, sys, subprocess
+
+def extract_tenant_id(url):
+    if url:
+        m = re.search(r'/instances/([^/?#]+)', url)
+        if m:
+            return m.group(1).strip()
+    return ""
 
 raw = os.environ.get("WXO_AGENT_MAP", "")
 try:
@@ -144,8 +151,8 @@ aws_dir       = os.path.join(script_dir, "aws")
 
 # Global defaults from the platform config file — every entry falls back to these
 # when it does not supply its own tenant / URL / key / token-url.
-_dflt_tenant   = os.environ.get("WXO_TENANT_ID",       "")
 _dflt_url      = os.environ.get("WXO_OTEL_EXPORT_URL",  "")
+_dflt_tenant   = extract_tenant_id(_dflt_url) or os.environ.get("WXO_TENANT_ID", "")
 _dflt_env      = os.environ.get("ENVIRONMENT_NAME",     "draft")
 _dflt_api_key  = os.environ.get("API_KEY",              "")
 _dflt_tok_url  = os.environ.get("TOKEN_URL",            "")
@@ -156,6 +163,7 @@ for agent_ref, cfg in agent_map.items():
         print(f"  ✗ WXO_AGENT_MAP entry '{agent_ref}' missing required field: wxo_agent_id", file=sys.stderr)
         sys.exit(1)
 
+    export_url = cfg.get("wxo_otel_export_url") or _dflt_url
     env = os.environ.copy()
     env["AGENT_REF"]           = agent_ref
     env["WXO_AGENT_ID"]        = cfg["wxo_agent_id"]
@@ -163,8 +171,8 @@ for agent_ref, cfg in agent_map.items():
         # CPD: no tenant header; export URL derived from CPD_* (or per-agent override)
         env["WXO_TENANT_ID"]   = ""
     else:
-        env["WXO_TENANT_ID"]   = cfg.get("wxo_tenant_id")       or _dflt_tenant
-    env["WXO_OTEL_EXPORT_URL"] = cfg.get("wxo_otel_export_url") or _dflt_url
+        env["WXO_TENANT_ID"]   = cfg.get("wxo_tenant_id") or extract_tenant_id(export_url) or _dflt_tenant
+    env["WXO_OTEL_EXPORT_URL"] = export_url
     env["WXO_AGENT_NAME"]      = cfg.get("wxo_agent_name",  "")
     env["WXO_DISPLAY_NAME"]    = cfg.get("wxo_display_name", "")
     env["ENVIRONMENT_NAME"]    = cfg.get("environment", _dflt_env)

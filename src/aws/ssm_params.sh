@@ -64,9 +64,13 @@ if [ "${WXO_DEPLOYMENT_MODE:-cloud}" = "cpd" ]; then
     echo "CPD instance : ${CPD_INSTANCE_ID}"
     echo ""
     _put_cpd() {
-        aws ssm put-parameter --region "${AWS_REGION}" --name "$1" --value "$2" \
-            --type "$3" --overwrite --query "Version" --output text > /dev/null
-        echo "  ✓ $1"
+        local name="$1" value="$2" ptype="$3"
+        python3 -c "
+import boto3, os, sys
+ssm = boto3.client('ssm', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
+ssm.put_parameter(Name=sys.argv[1], Value=sys.argv[2], Type=sys.argv[3], Overwrite=True)
+" "${name}" "${value}" "${ptype}"
+        echo "  ✓ ${name}"
     }
     _put_cpd "/wxo-agent/cpd/host_url"    "${CPD_HOST_URL}"    "String"
     _put_cpd "/wxo-agent/cpd/username"    "${CPD_USERNAME}"    "SecureString"
@@ -76,6 +80,14 @@ if [ "${WXO_DEPLOYMENT_MODE:-cloud}" = "cpd" ]; then
     echo ""
     echo "CPD credentials stored under /wxo-agent/cpd/."
     exit 0
+fi
+
+if [ -z "${WXO_TENANT_ID:-}" ] && [ -n "${WXO_OTEL_EXPORT_URL:-}" ]; then
+    if [[ "${WXO_OTEL_EXPORT_URL}" =~ /instances/([^/]+) ]]; then
+        WXO_TENANT_ID="${BASH_REMATCH[1]}"
+        WXO_TENANT_ID="${WXO_TENANT_ID%%\?*}"
+        WXO_TENANT_ID="${WXO_TENANT_ID%%\#*}"
+    fi
 fi
 
 echo "Storing WXO tenant credentials in AWS SSM Parameter Store..."
@@ -89,15 +101,20 @@ put_param() {
     local value="$2"
     local description="$3"
 
-    aws ssm put-parameter \
-        --region "${AWS_REGION}" \
-        --name "${name}" \
-        --value "${value}" \
-        --type "SecureString" \
-        --description "${description}" \
-        --overwrite \
-        --query "Version" \
-        --output text
+    python3 -c "
+import boto3, os, sys
+ssm = boto3.client('ssm', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
+name = sys.argv[1]
+value = sys.argv[2]
+desc = sys.argv[3]
+ssm.put_parameter(
+    Name=name,
+    Value=value,
+    Type='SecureString',
+    Description=desc,
+    Overwrite=True
+)
+" "${name}" "${value}" "${description}"
 
     echo "  ✓ ${name}"
 }

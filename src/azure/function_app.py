@@ -1,18 +1,18 @@
 """
 function_app.py
 ===============
-Azure Function — Timer trigger (every 30 seconds).
+Azure Function — Timer trigger (every 15 seconds).
 
 Equivalent of AWS AgentCore's built-in observability callback:
   • AWS:   AgentCore fires Lambda after every invocation automatically
   • Azure: App Insights captures every invocation in AppGenAIContent;
-           this Function polls that table every 30 s and forwards each
+           this Function polls that table every 15 s and forwards each
            new invocation to WXO Agent Analytics — zero change to callers.
 
 Flow:
   1. User calls agent directly (any URL, any protocol, unchanged)
   2. Azure AI Foundry auto-emits OTEL → App Insights → AppGenAIContent
-  3. This function wakes up every 30 s, queries new rows via KQL
+  3. This function wakes up every 15 s, queries new rows via KQL
   4. For each root span (invoke_agent), builds an OTLP span and POSTs to WXO
   5. Cursor advances so nothing is double-counted
 
@@ -195,6 +195,14 @@ def _cpd_export_url() -> str:
     if not (host and ns and iid):
         return ""
     return f"{host.rstrip('/')}/{ns}/instances/{iid}/v1/agentops-v3/traces"
+
+
+def _extract_tenant_id(url: str) -> str:
+    if url:
+        m = re.search(r'/instances/([^/?#]+)', url)
+        if m:
+            return m.group(1).strip()
+    return ""
 
 
 def _get_cpd_bearer_token() -> str:
@@ -516,40 +524,100 @@ def _query_new_invocations(since: str) -> list[dict]:
     # The invoke_agent row carries no usage or tool data.  The `chat` row (token usage)
     # and the `execute_tool` rows (arguments / result) share its gen_ai.response.id, so
     # they are joined in here to report real tokens and tool calls instead of estimates.
+    # Support both kind:prompt agents (AppGenAIContent) and kind:hosted agents (AppDependencies)
     kql = f"""
-let detail = AppGenAIContent
+let prompt_detail = AppGenAIContent
 | where ingestion_time() > ago({_POLL_WINDOW_MIN}m)
 | extend d = parse_json(Attributes)
 | extend rid = tostring(d['gen_ai.response.id']), dop = tostring(d['gen_ai.operation.name'])
 | where isnotempty(rid);
-let tool_rows = detail
+let prompt_tools = prompt_detail
 | where dop == 'execute_tool'
 | summarize ToolCalls = make_list(bag_pack('name', tostring(d['gen_ai.tool.name']), 'input', ToolCallArguments, 'output', ToolCallResult)) by rid;
-let usage_rows = detail
+let prompt_usage = prompt_detail
 | where dop == 'chat'
 | summarize chat_in = sum(toint(d['gen_ai.usage.input_tokens'])), chat_out = sum(toint(d['gen_ai.usage.output_tokens'])) by rid;
-AppGenAIContent
+// Workflow agents: each inner agent's GenAI content row has SpanId == the id of its
+// `invoke_agent <name>` dependency, which gives the step name (Writer / Reviewer / ...).
+let step_names = AppDependencies
+| where ingestion_time() > ago({_POLL_WINDOW_MIN}m)
+| where Name startswith 'invoke_agent ' and DependencyType == 'InProc'
+| project dep_id = Id, step_name = trim(' ', substring(Name, 13));
+let prompt_agents = AppGenAIContent
 | where ingestion_time() > datetime('{since}')
 | where ingestion_time() > ago({_POLL_WINDOW_MIN}m)
 | where parse_json(Attributes)['gen_ai.operation.name'] == 'invoke_agent'
 | extend attrs = parse_json(Attributes)
 | extend rid = tostring(attrs['gen_ai.response.id'])
-| join kind=leftouter tool_rows on rid
-| join kind=leftouter usage_rows on rid
+| join kind=leftouter prompt_tools on rid
+| join kind=leftouter prompt_usage on rid
+| join kind=leftouter step_names on $left.SpanId == $right.dep_id
 | project
     TimeGenerated,
+    step_name      = coalesce(step_name, ''),
     IngestTime     = ingestion_time(),
     response_id    = rid,
     TraceId,
     AgentName,
     InputMessages,
     OutputMessages,
-    session_id = tostring(coalesce(attrs['gen_ai.conversation.id'], attrs['thread.id'], attrs['conversation.id'], attrs['session.id'])),
-    user_id = tostring(coalesce(attrs['langfuse.user.id'], attrs['user.id'])),
-    model_name = tostring(coalesce(attrs['gen_ai.response.model'], attrs['gen_ai.request.model'], attrs['llm.model_name'])),
-    input_tokens  = toint(coalesce(attrs['gen_ai.usage.input_tokens'], attrs['gen_ai.usage.prompt_tokens'], chat_in)),
-    output_tokens = toint(coalesce(attrs['gen_ai.usage.output_tokens'], attrs['gen_ai.usage.completion_tokens'], chat_out)),
-    ToolCalls
+    session_id     = tostring(coalesce(attrs['gen_ai.conversation.id'], attrs['thread.id'], attrs['conversation.id'], attrs['session.id'])),
+    user_id        = tostring(coalesce(attrs['langfuse.user.id'], attrs['user.id'])),
+    model_name     = tostring(coalesce(attrs['gen_ai.response.model'], attrs['gen_ai.request.model'], attrs['llm.model_name'])),
+    input_tokens   = toint(coalesce(attrs['gen_ai.usage.input_tokens'], attrs['gen_ai.usage.prompt_tokens'], chat_in)),
+    output_tokens  = toint(coalesce(attrs['gen_ai.usage.output_tokens'], attrs['gen_ai.usage.completion_tokens'], chat_out)),
+    ToolCalls;
+// Hosted agents (agentserver + opentelemetry-instrumentation-openai-v2) do not put the
+// prompt / completion on the span.  With content recording enabled they are logged as
+// separate AppTraces rows (logger opentelemetry.instrumentation.openai_v2) whose
+// ParentId is the `chat` dependency Id: one row per input message (body {{"content": ..}}),
+// then one row for the choice (body {{"finish_reason":..,"message":{{"role":..,"content":..}}}}).
+// Rebuild them into the [{{role, parts:[{{type:text, content}}]}}] shape _handle_row parses.
+let hosted_logs = AppTraces
+| where ingestion_time() > ago({_POLL_WINDOW_MIN}m)
+| where tostring(parse_json(Properties)['logger_name']) == 'opentelemetry.instrumentation.openai_v2'
+| where Message != 'n/a'
+| extend m = parse_json(Message)
+| extend is_choice = isnotnull(m['finish_reason']);
+let hosted_in = hosted_logs
+| where not(is_choice)
+| order by TimeGenerated asc
+| summarize in_list = make_list(tostring(m['content'])) by OperationId, ParentId
+| project OperationId, ParentId, in_text = tostring(in_list[array_length(in_list) - 1]);
+let hosted_out = hosted_logs
+| where is_choice
+| summarize out_text = take_any(tostring(m['message']['content'])) by OperationId, ParentId;
+let hosted_content = hosted_in
+| join kind=fullouter hosted_out on OperationId, ParentId
+| project OperationId = coalesce(OperationId, OperationId1), ParentId = coalesce(ParentId, ParentId1), in_text, out_text;
+let hosted_agents = AppDependencies
+| where ingestion_time() > datetime('{since}')
+| where ingestion_time() > ago({_POLL_WINDOW_MIN}m)
+| where DependencyType has 'GenAI' or DependencyType == 'GenAI | openai'
+| join kind=leftouter hosted_content on $left.OperationId == $right.OperationId, $left.Id == $right.ParentId
+| extend props = parse_json(Properties)
+// The log rows can land a few seconds after the dependency; hold the row back briefly
+// so the prompt is not lost (older rows are sent regardless, e.g. content recording off).
+| where isnotempty(in_text) or ingestion_time() < ago(2m)
+| project
+    TimeGenerated,
+    IngestTime     = ingestion_time(),
+    response_id    = tostring(coalesce(props['gen_ai.response.id'], props['azure.ai.agentserver.response_id'])),
+    TraceId        = OperationId,
+    AgentName      = tostring(coalesce(props['gen_ai.agent.name'], AppRoleName)),
+    InputMessages  = tostring(coalesce(
+        props['gen_ai.prompt'], props['gen_ai.input.messages'],
+        iff(isnotempty(in_text), tostring(pack_array(bag_pack('role', 'user', 'parts', pack_array(bag_pack('type', 'text', 'content', in_text))))), ''))),
+    OutputMessages = tostring(coalesce(
+        props['gen_ai.completion'], props['gen_ai.output.messages'],
+        iff(isnotempty(out_text), tostring(pack_array(bag_pack('role', 'assistant', 'parts', pack_array(bag_pack('type', 'text', 'content', out_text))))), ''))),
+    session_id     = tostring(coalesce(props['gen_ai.conversation.id'], props['microsoft.session.id'], props['azure.ai.agentserver.session_id'], OperationId)),
+    user_id        = tostring(coalesce(props['user.id'], props['gen_ai.user.id'])),
+    model_name     = tostring(coalesce(props['gen_ai.response.model'], props['gen_ai.request.model'], Name)),
+    input_tokens   = toint(coalesce(props['gen_ai.usage.input_tokens'], props['gen_ai.usage.prompt_tokens'])),
+    output_tokens  = toint(coalesce(props['gen_ai.usage.output_tokens'], props['gen_ai.usage.completion_tokens'])),
+    ToolCalls      = dynamic([]);
+union prompt_agents, hosted_agents
 | order by IngestTime asc
 """
     token = _get_la_token()
@@ -597,6 +665,22 @@ def _get_ai_token() -> str:
         ttl = 3300
     _AI_TOKEN_CACHE.update(token=token, expires_at=now + ttl)
     return token
+
+
+def _fetch_response_data(response_id: str) -> dict:
+    """Fetch authoritative response data (input, output, usage, tool calls) from Responses API."""
+    endpoint = os.environ.get("PROJECT_ENDPOINT", "").rstrip("/")
+    if not (endpoint and response_id):
+        return {}
+    try:
+        req = Request(f"{endpoint}/openai/v1/responses/{response_id}",
+                      headers={"Authorization": f"Bearer {_get_ai_token()}"})
+        with urlopen(req, timeout=10, context=ssl.create_default_context()) as resp:
+            body = json.loads(resp.read())
+            return body if isinstance(body, dict) else {}
+    except Exception as exc:
+        logger.warning(f"[RESPONSE] lookup failed for {response_id}: {exc}")
+        return {}
 
 
 def _fetch_response_usage(response_id: str) -> tuple[int, int] | None:
@@ -689,6 +773,48 @@ def _extract_usage(resp_body: dict) -> dict:
 # Row → normalised event dict for span building
 # ---------------------------------------------------------------------------
 
+def _tool_calls_from_messages(input_json: str, output_json: str) -> list[dict]:
+    """Extract {name, input, output} tool calls for the CURRENT turn from message JSON."""
+    def _load(s: str) -> list:
+        try:
+            v = json.loads(s or "[]")
+            return v if isinstance(v, list) else []
+        except Exception:
+            return []
+
+    in_msgs = _load(input_json)
+    last_user = max((i for i, m in enumerate(in_msgs) if isinstance(m, dict) and m.get("role") == "user"), default=-1)
+    current = in_msgs[last_user + 1:]
+
+    calls: list[dict] = []
+    for msg in current:
+        if not isinstance(msg, dict):
+            continue
+        for part in msg.get("parts", []) or []:
+            ptype = part.get("type")
+            if msg.get("role") == "assistant" and ptype == "tool_call" and part.get("name"):
+                calls.append({"name": part["name"],
+                              "input": json.dumps(part.get("arguments") or {}),
+                              "output": ""})
+            elif ptype == "tool_call_response":
+                # Pair the result with the oldest call that has no output yet.
+                for c in calls:
+                    if not c["output"]:
+                        c["output"] = str(part.get("response") or "")
+                        break
+
+    # Tool calls the model is requesting in this turn's output (no result yet).
+    for msg in _load(output_json):
+        if not isinstance(msg, dict):
+            continue
+        for part in msg.get("parts", []) or []:
+            if part.get("type") == "tool_call" and part.get("name"):
+                calls.append({"name": part["name"],
+                              "input": json.dumps(part.get("arguments") or {}),
+                              "output": ""})
+    return calls
+
+
 def _row_to_event(row: dict) -> dict:
     def _user_text(messages_json: str) -> str:
         try:
@@ -717,9 +843,22 @@ def _row_to_event(row: dict) -> dict:
 
     input_tokens  = int(row.get("input_tokens")  or 0)
     output_tokens = int(row.get("output_tokens") or 0)
-    _api_usage = _fetch_response_usage(str(row.get("response_id") or ""))
-    if _api_usage:
-        input_tokens, output_tokens = _api_usage
+    resp_id = str(row.get("response_id") or "")
+    if resp_id and (not prompt or not response or (input_tokens == 0 and output_tokens == 0)):
+        resp_data = _fetch_response_data(resp_id)
+        if resp_data:
+            if not prompt:
+                prompt = _extract_input(resp_data)
+            if not response:
+                response = _extract_output(resp_data)
+            u = _extract_usage(resp_data)
+            if u:
+                input_tokens = u.get("inputTokens", input_tokens)
+                output_tokens = u.get("outputTokens", output_tokens)
+    elif resp_id:
+        _api_usage = _fetch_response_usage(resp_id)
+        if _api_usage:
+            input_tokens, output_tokens = _api_usage
     tokens_estimated = input_tokens == 0 and output_tokens == 0
 
     # KQL only exposes TimeGenerated (log arrival time), not the real span start/end, so
@@ -732,6 +871,11 @@ def _row_to_event(row: dict) -> dict:
     if tokens_estimated:
         input_tokens  = _count_tokens(prompt)
         output_tokens = _count_tokens(response)
+
+    if not prompt:
+        prompt = f"User invocation for {row.get('AgentName', 'agent')}"
+    if not response:
+        response = f"Response from {row.get('AgentName', 'agent')}"
 
     # ── Extract tool calls from the KQL row ───────────────────────────────────
     # Azure AI Foundry Log Analytics rows may carry a ToolCalls JSON column
@@ -756,6 +900,16 @@ def _row_to_event(row: dict) -> dict:
         except Exception:
             pass
 
+    # ── Fallback: client-side function tools ─────────────────────────────────
+    # kind:prompt agents whose tools are client-side functions emit no `execute_tool`
+    # rows, so ToolCalls is empty.  The calls are instead embedded in the message
+    # JSON: a turn that *requests* a tool carries a `tool_call` part in
+    # OutputMessages; the follow-up turn carries the `tool_call` (+ its
+    # `tool_call_response`) in InputMessages.  Only messages after the last user
+    # message are read so earlier turns of a conversation are not replayed.
+    if not tool_calls:
+        tool_calls = _tool_calls_from_messages(row.get("InputMessages", ""), row.get("OutputMessages", ""))
+
     return {
         "prompt":           prompt,
         "response":         response,
@@ -776,6 +930,7 @@ def _row_to_event(row: dict) -> dict:
         "tokens_estimated": tokens_estimated,
         "error_msg":        "",
         "tool_calls":       tool_calls,
+        "steps":            row.get("steps") or [],
     }
 
 
@@ -1045,6 +1200,47 @@ def _build_otlp_payload(
             ],
         }]
 
+    # ── Workflow steps — one AGENT span per inner agent, under the root ───────
+    # A workflow trace is collapsed into a single push; each inner agent (Writer,
+    # Reviewer, ...) becomes a child span laid out sequentially in the span window.
+    _steps = parsed.get("steps") or []
+    _step_spans = []
+    if _steps:
+        _slot = max(1, (end_ns - start_ns) // (len(_steps) + 1))
+        for _i, _st in enumerate(_steps):
+            _s_start = start_ns + _slot * _i + _slot // 4
+            _s_end   = start_ns + _slot * (_i + 1)
+            _s_usage = json.dumps({
+                "input":  _st["input_tokens"], "output": _st["output_tokens"],
+                "total":  _st["input_tokens"] + _st["output_tokens"],
+            })
+            _step_spans.append({
+                "traceId":            trace_id,
+                "spanId":             secrets.token_hex(8),
+                "parentSpanId":       span_id,
+                "name":               f"invoke_agent {_st['name']}", "kind": 3,
+                "startTimeUnixNano":  _s_start, "endTimeUnixNano": max(_s_end, _s_start + 1_000_000),
+                "status":             {"code": 0},
+                "attributes":         [
+                    _sv("openinference.span.kind", "AGENT"),
+                    _sv("gen_ai.operation.name",   "invoke_agent"),
+                    _sv("gen_ai.agent.name",       _st["name"]),
+                    _sv("gen_ai.system",           "azure_ai_foundry"),
+                    _sv("gen_ai.request.model",    _st["model"] or _model),
+                    _sv("llm.model_name",          _st["model"] or _model),
+                    _sv("input.value",             _st["input"][:2000]),
+                    _sv("output.value",            _st["output"][:2000]),
+                    _sv("gen_ai.prompt",           _st["input"][:2000]),
+                    _sv("gen_ai.completion",       _st["output"][:2000]),
+                    _iv("gen_ai.usage.input_tokens",  _st["input_tokens"]),
+                    _iv("gen_ai.usage.output_tokens", _st["output_tokens"]),
+                    _iv("llm.token_count.prompt",     _st["input_tokens"]),
+                    _iv("llm.token_count.completion", _st["output_tokens"]),
+                    _sv("provided_usage_details",             _s_usage),
+                    _sv("langfuse.observation.usage_details", _s_usage),
+                ],
+            })
+
     spans = [
         root_span,
         {
@@ -1065,6 +1261,7 @@ def _build_otlp_payload(
         },
         *_tool_spans,
         *_rv_spans,
+        *_step_spans,
     ]
 
     return {
@@ -1149,8 +1346,8 @@ def _get_agent_mapping() -> dict[str, dict]:
 def _handle_row(row: dict) -> dict:
     # Global defaults — used when the agent map does not override them
     cpd_mode            = _deployment_mode() == "cpd"
-    default_tenant_id   = "" if cpd_mode else _get_config("WXO_TENANT_ID")
     default_export_url  = _cpd_export_url() if cpd_mode else _get_config("WXO_OTEL_EXPORT_URL")
+    default_tenant_id   = "" if cpd_mode else (_extract_tenant_id(default_export_url) or _get_config("WXO_TENANT_ID"))
     default_environment = (_get_config("WXO_ENVIRONMENT_NAME") or "draft").strip()
 
     # AgentName comes directly from the KQL result row
@@ -1163,8 +1360,8 @@ def _handle_row(row: dict) -> dict:
         agent_id           = cfg.get("agent_id", agent_name)
         agent_display_name = cfg.get("display_name", agent_name)
         # Per-agent tenant routing — falls back to global defaults
-        tenant_id          = cfg.get("tenant_id")       or default_tenant_id
         export_url         = cfg.get("otel_export_url") or default_export_url
+        tenant_id          = cfg.get("tenant_id")       or _extract_tenant_id(export_url) or default_tenant_id
         api_key            = cfg.get("api_key",   "")
         token_url          = cfg.get("token_url", "")
         environment        = cfg.get("environment", default_environment)
@@ -1172,8 +1369,8 @@ def _handle_row(row: dict) -> dict:
         fallback_id        = _get_config("WXO_AGENT_ID")
         agent_id           = fallback_id if fallback_id else agent_name
         agent_display_name = _get_config("WXO_AGENT_DISPLAY_NAME") or agent_name
-        tenant_id          = default_tenant_id
         export_url         = default_export_url
+        tenant_id          = _extract_tenant_id(export_url) or default_tenant_id
         api_key            = ""
         token_url          = ""
         environment        = default_environment
@@ -1238,14 +1435,85 @@ def _handle_row(row: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Azure Function — Timer trigger every 30 seconds
+# Azure Function — Timer trigger every 15 seconds
 # ---------------------------------------------------------------------------
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
 
+def _last_text(messages_json: str, role: str) -> str:
+    """Text of the last `role` message in a [{role, parts:[{type:text, content}]}] JSON string."""
+    try:
+        for msg in reversed(json.loads(messages_json or "[]")):
+            if msg.get("role") == role:
+                for part in msg.get("parts", []):
+                    if part.get("type") == "text":
+                        return str(part.get("content", ""))
+    except Exception:
+        pass
+    return ""
+
+
+
+def _collapse_by_trace(rows: list[dict]) -> list[dict]:
+    """One row per TraceId.
+
+    A workflow agent emits several `invoke_agent` rows per trace: one per inner agent
+    (these carry the conversation id) plus platform-level rows with no conversation id.
+    Pushing each separately created one WXO session per row, most under a random session id.
+    Keep the conversation-bearing rows, take the first row's input (the user's prompt) and
+    the last row's output (the workflow's final answer), and sum tokens across them.
+    Single-row traces (prompt / hosted agents) pass through unchanged.
+    """
+    groups: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for r in rows:
+        key = r.get("TraceId") or f"_row{len(order)}"
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(r)
+
+    out: list[dict] = []
+    for key in order:
+        grp = groups[key]
+        if len(grp) == 1:
+            out.append(grp[0])
+            continue
+        # Prefer conversation-bearing rows; with none, the platform rows (which carry a
+        # response_id) duplicate the inner-agent rows, so drop them to avoid double counting.
+        with_conv = ([r for r in grp if r.get("session_id")]
+                     or [r for r in grp if not r.get("response_id")]
+                     or grp)
+        with_conv.sort(key=lambda r: str(r.get("TimeGenerated") or ""))
+        first, last = with_conv[0], with_conv[-1]
+        merged = dict(first)
+        merged["OutputMessages"]  = last.get("OutputMessages", "")
+        merged["input_tokens"]    = sum(int(r.get("input_tokens") or 0) for r in with_conv)
+        merged["output_tokens"]   = sum(int(r.get("output_tokens") or 0) for r in with_conv)
+        merged["IngestTime"]      = max(str(r.get("IngestTime") or "") for r in grp) or first.get("IngestTime")
+        tools: list = []
+        for r in with_conv:
+            tc = r.get("ToolCalls")
+            if isinstance(tc, list):
+                tools.extend(tc)
+        merged["ToolCalls"] = tools or first.get("ToolCalls")
+        if len(with_conv) > 1:
+            merged["steps"] = [{
+                "name":          r.get("step_name") or r.get("AgentName") or f"step_{i + 1}",
+                "input":         _last_text(r.get("InputMessages", ""), "user"),
+                "output":        _last_text(r.get("OutputMessages", ""), "assistant"),
+                "model":         r.get("model_name") or "",
+                "input_tokens":  int(r.get("input_tokens") or 0),
+                "output_tokens": int(r.get("output_tokens") or 0),
+            } for i, r in enumerate(with_conv)]
+        logger.info(f"[poll] collapsed {len(grp)} rows -> 1 for trace={key} session={merged.get('session_id')}")
+        out.append(merged)
+    return out
+
+
 @app.timer_trigger(
-    schedule="*/30 * * * * *",
+    schedule="*/15 * * * * *",
     arg_name="timer",
     run_on_startup=True,
     use_monitor=False,
@@ -1261,7 +1529,7 @@ def poll_appinsights(timer: func.TimerRequest) -> None:
         logger.error(f"[poll] query failed: {exc}")
         return
 
-    new_rows = [r for r in rows if not _already_seen(r.get("TraceId", ""))]
+    new_rows = _collapse_by_trace([r for r in rows if not _already_seen(r.get("TraceId", ""))])
     logger.info(f"[poll] {len(rows)} in window, {len(new_rows)} unseen")
 
     if not new_rows:
@@ -1301,7 +1569,7 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
             "poll_window": f"last {_POLL_WINDOW_MIN} min",
             "dedup_seen":  len(_SEEN_TRACE_IDS),
             "last_cursor": cursor,
-            "schedule":    "every 30s",
+            "schedule":    "every 15s",
         }),
         mimetype="application/json",
     )
